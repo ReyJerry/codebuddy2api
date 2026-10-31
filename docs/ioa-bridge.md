@@ -78,6 +78,26 @@ bypass Magpie's own limits or the model's actual context window. Extremely long
 histories may incur significant upstream usage. Request bytes are read incrementally
 with early rejection once the configured limit is reached.
 
+
+### Codex tool schema budget (independent of HTTP body budget)
+
+Codex Shell/Patch/MCP tool definitions can exceed the former 24,000-character cap,
+which `/compact` does **not** reduce. The bridge now allows **512,000 characters**
+for combined tool schemas by default. An optional `IOA_BRIDGE_MAX_TOOL_SPEC_CHARS`
+(1,000–2,000,000) can adjust the bound on restart:
+
+```bash
+export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=1000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+Oversized schemas fail with `tool_spec_too_large`; no tool parameters are
+silently dropped. This is a local guard only, not a model context guarantee.
+The schema is included in the SDK prompt and may consume real AI TOKEN credits.
+Tools remain disabled by default; `IOA_BRIDGE_EXPERIMENTAL_TOOLS=1` is required.
+The opt-in JSON tool adapter is **not native function calling** and should be
+tested only with non-sensitive sandbox projects.
+
 ## Magpie / Codex
 
 Add a Custom OpenAI Responses provider in Magpie:

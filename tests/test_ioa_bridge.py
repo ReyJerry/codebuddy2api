@@ -337,3 +337,72 @@ def test_settings_long_context_defaults_and_env_overrides(monkeypatch, tmp_path)
     with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_PROMPT_CHARS": "36000000"}, clear=True):
         with pytest.raises(RuntimeError):
             Settings.from_env()
+
+
+def _large_codex_tool_schema():
+    """Representative oversized tool spec: nested parameter docs, not just top-level description."""
+    return [{"type": "function", "name": "shell_command", "description": "Run an approved command",
+             "parameters": {"type": "object", "properties": {
+                 f"argument_{i}": {"type": "string", "description": "D" * 4_000}
+                 for i in range(12)}, "required": ["argument_0"]}}]
+
+
+def test_codex_tool_schema_larger_than_legacy_limit_is_not_dropped():
+    schema = _large_codex_tool_schema()
+    # Regression: legacy 24K tool cap should not reject real Codex tool metadata.
+    assert 24_000 < len(json.dumps(schema, ensure_ascii=False)) < 512_000
+    b = FakeBackend('{"kind":"message","text":"OK"}')
+    c, b = client(b, tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "hello", "tools": schema, "tool_choice": "auto"})
+    assert r.status_code == 200, r.text[:300]
+    assert r.json()["status"] == "completed"
+    assert len(b.calls) == 1
+    assert 'argument_11' in b.calls[0][0]
+    assert '"required": ["argument_0"]' in b.calls[0][0]
+
+
+def test_explicit_tool_limit_fails_cleanly_before_any_model_request():
+    b = FakeBackend()
+    settings = Settings("z" * 32, "not-used", Path("/tmp"), True,
+                        max_tool_spec_chars=24_000)
+    c = TestClient(create_app(settings=settings, backend=b, catalog=FakeCatalog()))
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "hello", "tools": _large_codex_tool_schema()})
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "tool_spec_too_large"
+    assert "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS" in r.json()["error"]["message"]
+    assert not b.calls
+
+
+def test_no_tool_choice_and_disabled_tool_mode_do_not_raise_misleading_413():
+    huge_tools = _large_codex_tool_schema()
+    b = FakeBackend()
+    settings = Settings("z" * 32, "not-used", Path("/tmp"), True,
+                        max_tool_spec_chars=1_000)
+    c = TestClient(create_app(settings=settings, backend=b, catalog=FakeCatalog()))
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "hello", "tools": huge_tools,
+        "tool_choice": "none"})
+    assert r.status_code == 200, r.text[:300]
+    assert len(b.calls) == 1 and "Available tools JSON" not in b.calls[0][0]
+    b2 = FakeBackend()
+    c2, b2 = client(b2)
+    r2 = c2.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "hello", "tools": huge_tools})
+    assert r2.status_code == 422
+    assert r2.json()["error"]["code"] == "tools_not_enabled"
+    assert not b2.calls
+
+
+def test_env_tool_schema_bounds(tmp_path):
+    base = {"IOA_BRIDGE_KEY": "z" * 32, "CODEBUDDY_API_KEY": "secret",
+            "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa", "IOA_BRIDGE_CWD": str(tmp_path)}
+    with patch.dict(os.environ, base, clear=True):
+        assert Settings.from_env().max_tool_spec_chars == 512_000
+    with patch.dict(os.environ, {**base, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": "2000000"}, clear=True):
+        assert Settings.from_env().max_tool_spec_chars == 2_000_000
+    for bad in ("0", "2000001", "not-a-number"):
+        with patch.dict(os.environ, {**base, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": bad}, clear=True):
+            with pytest.raises(RuntimeError):
+                Settings.from_env()

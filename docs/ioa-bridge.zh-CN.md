@@ -113,6 +113,26 @@ uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
 对于极长历史先估算实际 Token、检查 AI TOKEN 扣费，避免重复发送大 Prompt。
 内部使用 `request.stream()` 逐块接收并在超出阈值时立即拒绝，避免无限制缓冲。
 
+
+### Codex 工具声明大小（不同于历史请求大小）
+
+Codex 的 Shell/Patch/MCP 工具 Schema 可能超过旧版的 24,000 字符上限，
+即使执行 `/compact` 也不会缩短这些工具声明。现在默认最多允许
+**512,000 字符**，并单独检查在 `tool_prompt` 中加入工具后的总 Prompt 长度。
+如果确实需要，可以设置 `IOA_BRIDGE_MAX_TOOL_SPEC_CHARS`（允许 1,000–2,000,000）
+并**重启本地 8791 服务**：
+
+```bash
+export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=1000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+超限会明确返回 `tool_spec_too_large`，不会悄悄删除工具参数。
+这只是本地上限，不代表模型能够可靠处理这么多工具，且工具定义会作为
+SDK Prompt 的一部分计入上下文并可能产生 AI TOKEN 费用。
+默认仍不允许工具执行；开启实验模式需要 `IOA_BRIDGE_EXPERIMENTAL_TOOLS=1`。
+工具模式采用 JSON Prompt 适配，**不是原生 Function Calling**，须在非敏感项目里验证。
+
 ## Magpie 接入
 
 在 Magpie 添加 **Custom / OpenAI Responses Provider**：

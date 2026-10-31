@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import ModelCatalog
-from .core import (BridgeError, MAX_INPUT_CHARS, MODEL_ID, conversation_prompt, encode_sse,
+from .core import (BridgeError, MAX_INPUT_CHARS, MAX_TOOL_SPEC_CHARS, MODEL_ID, conversation_prompt, encode_sse,
                    event, new_response, parse_tool_answer, response_usage,
                    tool_prompt, validate_tools)
 from .sdk_backend import SDKBackend
@@ -24,6 +24,7 @@ from .sessions import SessionManager, is_single_delta
 DEFAULT_MAX_BODY_MB = 128  # Large enough for typical 1M-token text histories (not a token guarantee).
 MAX_CONFIG_BODY_MB = 256
 MAX_CONFIG_PROMPT_CHARS = 32_000_000
+MAX_CONFIG_TOOL_SPEC_CHARS = 2_000_000
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -61,6 +62,7 @@ class Settings:
     experimental_tools: bool = False
     max_body_bytes: int = DEFAULT_MAX_BODY_MB * 1024 * 1024
     max_prompt_chars: int = MAX_INPUT_CHARS
+    max_tool_spec_chars: int = MAX_TOOL_SPEC_CHARS
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -78,8 +80,10 @@ class Settings:
         cwd.mkdir(parents=True, exist_ok=True)
         mb = _env_int("IOA_BRIDGE_MAX_BODY_MB", DEFAULT_MAX_BODY_MB, 1, MAX_CONFIG_BODY_MB)
         chars = _env_int("IOA_BRIDGE_MAX_PROMPT_CHARS", MAX_INPUT_CHARS, 100_000, MAX_CONFIG_PROMPT_CHARS)
+        tool_chars = _env_int("IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", MAX_TOOL_SPEC_CHARS,
+                              1_000, MAX_CONFIG_TOOL_SPEC_CHARS)
         return cls(key, api_key, cwd, os.getenv("IOA_BRIDGE_EXPERIMENTAL_TOOLS") == "1",
-                   mb * 1024 * 1024, chars)
+                   mb * 1024 * 1024, chars, tool_chars)
 
 
 def _error(err: BridgeError) -> JSONResponse:
@@ -209,10 +213,17 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
             if model not in allowed:
                 raise BridgeError("model_not_listed", "模型不在本地发现的目录中", 404)
             choice = body.get("tool_choice", "auto")
-            tools = validate_tools(body.get("tools"))
-            if tools and not settings.experimental_tools and choice != "none":
-                raise BridgeError("tools_not_enabled", "此桥接默认不支持 Codex 工具调用；实验模式需显式开启", 422)
-            requested_tools = tools if settings.experimental_tools and choice != "none" else []
+            raw_tools = body.get("tools")
+            # Do not spend memory checking 100K+ tool schemas when tools are
+            # explicitly disabled; avoid reporting a misleading 413 here.
+            if choice == "none":
+                requested_tools = []
+            else:
+                if raw_tools and not settings.experimental_tools:
+                    raise BridgeError("tools_not_enabled",
+                                      "此桥接默认不支持 Codex 工具调用；实验模式需显式开启", 422)
+                tools = validate_tools(raw_tools, max_chars=settings.max_tool_spec_chars)
+                requested_tools = tools if settings.experimental_tools else []
             if body.get("previous_response_id"):
                 raise BridgeError("unsupported_history", "不支持服务端 previous_response_id；请发送完整 input 历史", 422)
             if body.get("background"):

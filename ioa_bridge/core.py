@@ -10,7 +10,9 @@ from typing import Any
 
 MAX_INPUT_CHARS = 16_000_000  # Local character ceiling, NOT a model token limit.
 MAX_TOOLS = 64
-MAX_TOOL_SPEC_CHARS = 24_000
+# Cap for tool schema data passed to the experimental prompt-based adapter.
+# Not a context-window guarantee. Validated without dropping tool definitions.
+MAX_TOOL_SPEC_CHARS = 512_000
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
@@ -77,7 +79,7 @@ def _text_content(content: Any) -> str:
     return "\n".join(pieces)
 
 
-def validate_tools(value: Any) -> list[dict[str, Any]]:
+def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[dict[str, Any]]:
     if value in (None, []):
         return []
     if not isinstance(value, list) or len(value) > MAX_TOOLS:
@@ -98,8 +100,11 @@ def validate_tools(value: Any) -> list[dict[str, Any]]:
         else:
             spec["format"] = t.get("format", {"type": "text"})
         out.append(spec)
-    if len(json.dumps(out, ensure_ascii=False)) > MAX_TOOL_SPEC_CHARS:
-        raise BridgeError("unsupported_tools", "工具声明超过本地限制", 413)
+    # Tool schemas can be much larger than 24K with Codex / MCP. Never remove
+    # parameter definitions silently: the adapter needs them for correct calls.
+    if len(json.dumps(out, ensure_ascii=False)) > max_chars:
+        raise BridgeError("tool_spec_too_large",
+                          f"工具声明超过本地 {max_chars} 字符限制；可调整 IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", 413)
     if len({t["name"] for t in out}) != len(out):
         raise BridgeError("unsupported_tools", "工具名称不能重复", 422)
     return out
