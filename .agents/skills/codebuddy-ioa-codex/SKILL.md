@@ -1,0 +1,31 @@
+---
+name: codebuddy-ioa-codex
+description: Set up or troubleshoot an authorized CodeBuddy iOA API Key through the official Agent SDK, a localhost OpenAI Responses bridge, Magpie, and Codex App/CLI. Use for installation, iOA authentication, model selection, 404/413/422 errors, or end-to-end Codex tool testing. Never obtain unauthorized keys or bypass quotas.
+---
+
+# CodeBuddy iOA → Magpie → Codex setup
+
+Make this workflow work on **the owner's own computer**. The user must already have a legitimately issued CodeBuddy iOA API Key and permission to use it with third-party software. Do not ask the user to paste any real API Key, local bridge key, token, cookie, or company data into chat, logs, Git, or a tool's command arguments. Ask them to enter credentials in a trusted local terminal or Magpie UI. An iOA key is **not** the old codebuddy2api SaaS Credits key.
+
+Architecture: `Codex App / CLI → Magpie (typically 127.0.0.1:3425) → iOA SDK Responses bridge (127.0.0.1:8791) → official CodeBuddy Agent SDK → authorized iOA model`.
+
+The bridge is a distinct, experimental service from `ReyJerry/codebuddy2api` branch `feat/ioa-sdk-responses-bridge` (not the legacy 8787 WebUI). Its current Codex tool path is **Prompt-generated JSON → validated Responses tool call → actual Codex execution**, *not* native SDK MCP function calling. Keep that distinction clear; neither success nor model authorization is guaranteed for arbitrary accounts/models.
+
+Chinese owner quickstart: [快速开始](references/快速开始.md).
+
+## Workflow
+
+1. **Read-only survey.** Identify OS, Codex App/CLI, Magpie, `git`, `uv`, an existing bridge, and the user's chosen repository path. On macOS/Linux use `python3 "<this-skill>/scripts/bridge_setup.py" doctor`. Do not assume `codex` CLI exists just because the Codex App is installed. Ask for authorization to install software, clone code, modify app configurations, or perform paid calls **before** doing each. Never delete an old `codebuddy2api` clone or its `.env` / `auth/` files.
+2. **Prepare the bridge.** Review the source and fetch only the explicit GitHub repo/branch. Run `python3 "<this-skill>/scripts/bridge_setup.py" install`; an existing checkout is never reset, overwritten, or updated unless `--update` was explicitly authorized. If `uv` is missing, direct the owner to its trusted installer; do not run `curl | sh` automatically. See [setup](references/setup.md).
+3. **Set up a stable LOCAL key.** With permission run `python3 "<this-skill>/scripts/bridge_setup.py" init-key`, which creates a random 48-hex-character local bridge key in a private `0600` file outside Git, only if absent. This is **different** from `CODEBUDDY_API_KEY`. Use `copy-key` to paste that local key into Magpie; do not print it in an agent transcript. Never overwrite an existing key automatically: changing it invalidates the running server's clients.
+4. **Start (requires the owner's real key).** In a trusted **human terminal** run `python3 "<this-skill>/scripts/bridge_setup.py" start --experimental-tools` only after they approve experimental tools. It prompts for `CODEBUDDY_API_KEY` without echo when not already in its environment. It sets `CODEBUDDY_INTERNET_ENVIRONMENT=ioa`, uses SDK `permission_mode=default` and `tools=[]`, binds localhost:8791, and foreground-execs `uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge`. Do **not** change Codex App's existing full-access setting, bypass approvals, or enable native SDK Shell tools. Leave this terminal running.
+5. **Probe before connecting Codex.** Run `... bridge_setup.py probe` (free local `/health` and authenticated `/v1/models`). Choose a model **actually returned** and authorized for this account; do not assume `gpt-6-astra` or `glm-5.2-ioa` exists for everyone. A real paid request needs `... probe --model MODEL --invoke --accept-charges`, only after owner approves spending AI TOKEN. A local `/models` listing is not proof of backend authorization.
+6. **Wire Magpie.** Run `... bridge_setup.py magpie` to print UI fields. In **Providers → Add Custom**, set only **OpenAI Responses** URL `http://127.0.0.1:8791/v1`; leave OpenAI Chat Completions URL blank; API key is the **local** key from step 3. Add the validated model ID. In **Agents → Codex**, choose the `provider/model` ID shown by Magpie, then start a **new** Codex App session. Magpie typically listens on `127.0.0.1:3425`; never confuse it with 8791. If GUI automation is available, obtain owner's approval before clicking/saving, and do not open private authentication screens unnecessarily. Do not directly overwrite `~/.codex/config.toml` or Magpie's private JSON; use Magpie UI/official CLI. See [setup](references/setup.md).
+7. **Verify real tools safely.** In a *new disposable* Codex workspace, verify a real `exec_command` showing `pwd`, then real `apply_patch` creating a tiny module, then `exec_command` running a Python test. Inspect actual tool invocations, exit codes and stdout/stderr; a plausible assistant reply is **not** tool proof. After owner's approval, follow [end-to-end tests](references/e2e-tests.md). Do not test edits on production repositories. Record tool failures and actual model usage if available, without secrets.
+8. **Troubleshoot systematically.** Consult [error matrix](references/troubleshooting.md). Treat 404 (wrong API route), 401 (local key mismatch), 413 (body/tool schema/prompt), 422 (tool protocol, unsupported types or disabled tools), and 502 (SDK/protocol) separately. Never reflexively uncap every limit, auto-retry charged requests, or claim that a tool succeeded without a tool record.
+
+## Final user report
+
+Report source branch and verified commit, whether 8791 and Magpie are reachable, provider/approved model configured, real paid inference tested (or explicitly untested), real Codex Shell/Patch results, and limitations. Do not include keys, private paths outside those needed to diagnose, token-bearing URLs, or complete internal prompts.
+
+If a user lacks an authorized iOA key, stop after the read-only diagnostic and give legitimate provisioning instructions; the skill cannot grant enterprise entitlements or alter a Credits ledger. If they lack Magpie, offer the documented direct-Codex Responses configuration only on explicit request; do not silently change the user's intended chain.

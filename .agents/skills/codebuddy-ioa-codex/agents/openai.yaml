@@ -1,0 +1,6 @@
+interface:
+  display_name: "CodeBuddy iOA ↔ Codex"
+  short_description: "接入 iOA SDK、Magpie 和 Codex，并逐步排查问题"
+  default_prompt: "Use $codebuddy-ioa-codex to diagnose and set up my authorized CodeBuddy iOA → Magpie → Codex connection safely. Never ask me to paste credentials in chat."
+policy:
+  allow_implicit_invocation: true

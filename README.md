@@ -112,3 +112,10 @@ Thanks to the [LINUX DO](https://linux.do) community for providing an open and f
 ## Optional CodeBuddy iOA Agent SDK bridge (experimental)
 
 An isolated, local-only OpenAI Responses facade using the **official CodeBuddy Agent SDK** is available in [`ioa_bridge/`](ioa_bridge/). It uses the iOA API Key, not this gateway's SaaS credential pool or Credits ledger. Text / SSE are available; Codex tool calls are **experimental and disabled by default**. See [English setup](docs/ioa-bridge.md) and [中文说明](docs/ioa-bridge.zh-CN.md). Only use in an authorized environment. Do not commit credentials.
+
+
+## Installable Codex Skill: iOA → Magpie → Codex
+
+The reusable [**codebuddy-ioa-codex Skill**](.agents/skills/codebuddy-ioa-codex/SKILL.md) helps an **authorized** user install/diagnose the official iOA SDK bridge, create a private local key, connect Magpie **OpenAI Responses**, and test real Codex Shell/Patch calls. It never requests iOA secrets in chat, overwrites an existing checkout, or makes paid inference without explicit consent. This is an **experimental, prompt-based tool adapter**, not native SDK MCP.
+
+In Codex, use `$skill-installer` with [this distribution folder](https://github.com/ReyJerry/codebuddy2api/tree/codex-skill-v1/.agents/skills/codebuddy-ioa-codex), or copy it to `~/.agents/skills/codebuddy-ioa-codex/`; then invoke `$codebuddy-ioa-codex`. [中文快速开始](.agents/skills/codebuddy-ioa-codex/references/快速开始.md).
