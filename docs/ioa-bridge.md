@@ -81,22 +81,30 @@ with early rejection once the configured limit is reached.
 
 ### Codex tool schema budget (independent of HTTP body budget)
 
-Codex Shell/Patch/MCP tool definitions can exceed the former 24,000-character cap,
-which `/compact` does **not** reduce. The bridge now allows **512,000 characters**
-for combined tool schemas by default. An optional `IOA_BRIDGE_MAX_TOOL_SPEC_CHARS`
-(1,000–2,000,000) can adjust the bound on restart:
+Codex App with MCP can send more than 64 tools. The old `MAX_TOOLS=64`
+incorrectly reported a generic 422 for this case. There is now **no fixed tool
+count limit**; all `function`/`custom` declarations are validated, with their
+serialized sizes counted incrementally against a bounded overall budget.
+No tool schemas, descriptions or parameters are silently dropped. Invalid
+list shapes, duplicate names and unsupported types have distinct 422 codes.
+
+The combined tool schema budget is **8,000,000 characters** by default, with a
+configurable range of 1,000–32,000,000. Set a higher value before restarting:
 
 ```bash
-export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=1000000
+export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=16000000
+export IOA_BRIDGE_EXPERIMENTAL_TOOLS=1
 uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
 ```
 
-Oversized schemas fail with `tool_spec_too_large`; no tool parameters are
-silently dropped. This is a local guard only, not a model context guarantee.
-The schema is included in the SDK prompt and may consume real AI TOKEN credits.
-Tools remain disabled by default; `IOA_BRIDGE_EXPERIMENTAL_TOOLS=1` is required.
-The opt-in JSON tool adapter is **not native function calling** and should be
-tested only with non-sensitive sandbox projects.
+HTTP body limit remains 128 MiB by default (max configured 256 MiB); the
+converted combined prompt limit remains 16M chars by default (max 32M).
+Tool schemas count toward the combined prompt. These limits protect the local
+process against unbounded memory use and are **not equivalent to unlimited
+model context**. Oversized requests fail with explicit 413 codes; `/compact`
+does not shrink tool schemas. Large schemas consume real upstream tokens and
+potential AI TOKEN credits. The JSON prompt adapter is **not native function
+calling** and must be used only in authorized non-sensitive test projects.
 
 ## Magpie / Codex
 

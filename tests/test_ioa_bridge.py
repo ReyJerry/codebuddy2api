@@ -401,10 +401,100 @@ def test_env_tool_schema_bounds(tmp_path):
     base = {"IOA_BRIDGE_KEY": "z" * 32, "CODEBUDDY_API_KEY": "secret",
             "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa", "IOA_BRIDGE_CWD": str(tmp_path)}
     with patch.dict(os.environ, base, clear=True):
-        assert Settings.from_env().max_tool_spec_chars == 512_000
+        assert Settings.from_env().max_tool_spec_chars == 8_000_000
     with patch.dict(os.environ, {**base, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": "2000000"}, clear=True):
         assert Settings.from_env().max_tool_spec_chars == 2_000_000
-    for bad in ("0", "2000001", "not-a-number"):
+    for bad in ("0", "32000001", "not-a-number"):
         with patch.dict(os.environ, {**base, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": bad}, clear=True):
             with pytest.raises(RuntimeError):
                 Settings.from_env()
+
+
+def _many_codex_tools(count=180):
+    return [{"type": "function", "name": f"mcp__demo__tool_{i}",
+             "description": f"Synthetic tool {i} description",
+             "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}
+            for i in range(count)]
+
+
+def test_more_than_64_tools_are_preserved_and_accepted():
+    """Previous builds wrongly rejected valid 65+ tool lists with 422."""
+    tools = _many_codex_tools(180)
+    assert len(tools) > 64
+    b = FakeBackend('{"kind":"message","text":"OK"}')
+    c, b = client(b, tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "reply", "tools": tools})
+    assert r.status_code == 200, r.text[:300]
+    assert len(b.calls) == 1
+    assert 'mcp__demo__tool_0' in b.calls[0][0]
+    assert 'mcp__demo__tool_179' in b.calls[0][0]
+    assert b.calls[0][0].count('"type": "function"') == len(tools)
+
+
+def test_tool_call_to_last_tool_in_180_item_list():
+    tools = _many_codex_tools(180)
+    response = '{"kind":"tool_call","name":"mcp__demo__tool_179","arguments":{"arg":"ok"}}'
+    b = FakeBackend(response)
+    c, b = client(b, tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "Call the last tool", "tools": tools})
+    assert r.status_code == 200, r.text[:300]
+    output = r.json()["output"][0]
+    assert output["type"] == "function_call"
+    assert output["name"] == "mcp__demo__tool_179"
+    assert json.loads(output["arguments"])["arg"] == "ok"
+
+
+def test_distinct_tool_shape_duplicate_and_type_errors():
+    c, b = client(tools=True)
+    for invalid, expected in [
+        ({"type": "function"}, "invalid_tools_shape"),
+        ("tool", "invalid_tools_shape"),
+        (["not-an-object"], "invalid_tool_entry"),
+        ([{"type": "web_search", "name": "hosted"}], "unsupported_tool_type"),
+        (_many_codex_tools(1) * 2, "duplicate_tool_name"),
+    ]:
+        r = c.post("/v1/responses", headers=headers(), json={
+            "model": "demo-model", "input": "hello", "tools": invalid})
+        assert r.status_code == 422, r.text[:200]
+        assert r.json()["error"]["code"] == expected
+    assert not b.calls
+
+
+def test_no_description_truncation_and_incremental_budget_check():
+    extra_description = "d" * 1500
+    tools = _many_codex_tools(75)
+    tools[-1]["description"] = extra_description
+    full = validate_tools(tools)
+    assert full[-1]["description"] == extra_description
+    exact_chars = len(json.dumps(full, ensure_ascii=False))
+    assert len(json.dumps(full, ensure_ascii=False)) == exact_chars
+    assert len(validate_tools(tools, max_chars=exact_chars)) == len(tools)
+    with pytest.raises(BridgeError) as exc:
+        validate_tools(tools, max_chars=exact_chars - 1)
+    assert exc.value.code == "tool_spec_too_large" and exc.value.status == 413
+
+
+def test_large_tool_list_only_hits_explicit_budget_not_arbitrary_count():
+    tools = _many_codex_tools(200)
+    b = FakeBackend()
+    settings = Settings("z" * 32, "secret", Path("/tmp"), True,
+                        max_tool_spec_chars=2_000)
+    c = TestClient(create_app(settings=settings, backend=b, catalog=FakeCatalog()))
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "hello", "tools": tools})
+    assert r.status_code == 413 and r.json()["error"]["code"] == "tool_spec_too_large"
+    assert not b.calls
+
+
+def test_large_tool_budget_env_override(tmp_path):
+    env = {"IOA_BRIDGE_KEY": "z" * 32, "CODEBUDDY_API_KEY": "secret",
+           "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa", "IOA_BRIDGE_CWD": str(tmp_path)}
+    with patch.dict(os.environ, env, clear=True):
+        assert Settings.from_env().max_tool_spec_chars == 8_000_000
+    with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": "32000000"}, clear=True):
+        assert Settings.from_env().max_tool_spec_chars == 32_000_000
+    with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": "32000001"}, clear=True):
+        with pytest.raises(RuntimeError):
+            Settings.from_env()

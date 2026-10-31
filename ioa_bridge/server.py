@@ -24,7 +24,7 @@ from .sessions import SessionManager, is_single_delta
 DEFAULT_MAX_BODY_MB = 128  # Large enough for typical 1M-token text histories (not a token guarantee).
 MAX_CONFIG_BODY_MB = 256
 MAX_CONFIG_PROMPT_CHARS = 32_000_000
-MAX_CONFIG_TOOL_SPEC_CHARS = 2_000_000
+MAX_CONFIG_TOOL_SPEC_CHARS = 32_000_000
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:

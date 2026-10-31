@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from typing import Any
 
 MAX_INPUT_CHARS = 16_000_000  # Local character ceiling, NOT a model token limit.
-MAX_TOOLS = 64
-# Cap for tool schema data passed to the experimental prompt-based adapter.
-# Not a context-window guarantee. Validated without dropping tool definitions.
-MAX_TOOL_SPEC_CHARS = 512_000
+# No fixed tool COUNT cap. Large Codex/MCP registries are bounded by the
+# serialized schema budget instead; model context limits still apply.
+# Do not silently drop descriptions or parameters from the tool declarations.
+MAX_TOOL_SPEC_CHARS = 8_000_000
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
@@ -80,33 +80,57 @@ def _text_content(content: Any) -> str:
 
 
 def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[dict[str, Any]]:
-    if value in (None, []):
+    """Validate all Codex tool declarations without an arbitrary 64-tool cutoff.
+
+    Enforce a cumulative serialized-character budget incrementally so a huge
+    incoming tool list is rejected before creating an additional huge prompt.
+    Never silently drop tools, their descriptions or parameter schemas.
+    """
+    if value is None:
         return []
-    if not isinstance(value, list) or len(value) > MAX_TOOLS:
-        raise BridgeError("unsupported_tools", "工具列表格式错误或过长", 422)
-    out = []
-    for t in value:
-        if not isinstance(t, dict) or t.get("type") not in ("function", "custom"):
-            raise BridgeError("unsupported_tools", "只支持客户端 function/custom 工具，不支持托管工具", 422)
-        name = t.get("name")
+    if not isinstance(value, list):
+        raise BridgeError("invalid_tools_shape", "tools 必须是 JSON 数组；不能是对象或字符串", 422)
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # json.dumps(..., ensure_ascii=False) joins list items with ', '.
+    serialized_chars = 2  # opening and closing brackets
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise BridgeError("invalid_tool_entry", f"tools[{index}] 必须是 JSON 对象", 422)
+        kind = item.get("type")
+        if kind not in ("function", "custom"):
+            raise BridgeError("unsupported_tool_type",
+                              f"tools[{index}] 类型不受支持；仅允许 function/custom，不支持托管工具", 422)
+        name = item.get("name")
         if not isinstance(name, str) or not MODEL_ID.fullmatch(name):
-            raise BridgeError("unsupported_tools", "工具名称无效", 422)
-        spec = {"type": t["type"], "name": name, "description": str(t.get("description") or "")[:1024]}
-        if t["type"] == "function":
-            p = t.get("parameters", {"type": "object", "properties": {}})
-            if not isinstance(p, dict):
-                raise BridgeError("unsupported_tools", "函数 Schema 格式无效", 422)
-            spec["parameters"] = p
+            raise BridgeError("invalid_tool_name", f"tools[{index}] 的 name 无效", 422)
+        if name in seen:
+            raise BridgeError("duplicate_tool_name", f"tools[{index}] 的工具名称重复", 422)
+        seen.add(name)
+
+        description = item.get("description")
+        if description is None:
+            description = ""
+        if not isinstance(description, str):
+            raise BridgeError("invalid_tool_description", f"tools[{index}] 的 description 必须是字符串", 422)
+        spec = {"type": kind, "name": name, "description": description}
+        if kind == "function":
+            parameters = item.get("parameters", {"type": "object", "properties": {}})
+            if not isinstance(parameters, dict):
+                raise BridgeError("invalid_tool_schema", f"tools[{index}] 的 parameters 必须是对象", 422)
+            spec["parameters"] = parameters
         else:
-            spec["format"] = t.get("format", {"type": "text"})
+            spec["format"] = item.get("format", {"type": "text"})
+
+        if out:
+            serialized_chars += 2  # ', '
+        serialized_chars += len(json.dumps(spec, ensure_ascii=False))
+        if serialized_chars > max_chars:
+            raise BridgeError("tool_spec_too_large",
+                              f"工具声明总长度超过本地 {max_chars} 字符限制；"
+                              "可调整 IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", 413)
         out.append(spec)
-    # Tool schemas can be much larger than 24K with Codex / MCP. Never remove
-    # parameter definitions silently: the adapter needs them for correct calls.
-    if len(json.dumps(out, ensure_ascii=False)) > max_chars:
-        raise BridgeError("tool_spec_too_large",
-                          f"工具声明超过本地 {max_chars} 字符限制；可调整 IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", 413)
-    if len({t["name"] for t in out}) != len(out):
-        raise BridgeError("unsupported_tools", "工具名称不能重复", 422)
     return out
 
 

@@ -116,22 +116,29 @@ uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
 
 ### Codex 工具声明大小（不同于历史请求大小）
 
-Codex 的 Shell/Patch/MCP 工具 Schema 可能超过旧版的 24,000 字符上限，
-即使执行 `/compact` 也不会缩短这些工具声明。现在默认最多允许
-**512,000 字符**，并单独检查在 `tool_prompt` 中加入工具后的总 Prompt 长度。
-如果确实需要，可以设置 `IOA_BRIDGE_MAX_TOOL_SPEC_CHARS`（允许 1,000–2,000,000）
-并**重启本地 8791 服务**：
+Codex App 与 MCP 可能提供超过 64 个工具。旧版的 `MAX_TOOLS=64` 把工具数量超限
+错误地混在“工具列表格式错误或过长”的 422 中。**现在不设固定工具数量上限**；
+对合法的 function/custom 工具逐个验证，并按序列化字符预算累计检查，
+不默默移除工具、说明文字或参数 Schema。格式不正确会返回具体的 422 错误代码。
+
+工具声明默认最大 **8,000,000 字符**（原来 512,000），配置范围为
+1,000–32,000,000。若模型和机器资源允许，可在启动终端中进一步调整：
 
 ```bash
-export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=1000000
+export IOA_BRIDGE_MAX_TOOL_SPEC_CHARS=16000000
+export IOA_BRIDGE_EXPERIMENTAL_TOOLS=1
 uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
 ```
 
-超限会明确返回 `tool_spec_too_large`，不会悄悄删除工具参数。
-这只是本地上限，不代表模型能够可靠处理这么多工具，且工具定义会作为
-SDK Prompt 的一部分计入上下文并可能产生 AI TOKEN 费用。
+HTTP 请求体仍默认 128 MiB、最大可配置 256 MiB；总 Prompt 默认 16,000,000
+字符、最大可配置 32,000,000 字符。两项额度各自独立，工具 Schema 也计入总 Prompt。
+这些是避免进程耗尽内存的安全边界，而**不是无限长度**、也不保证上游模型接受。
+超限明确返回 `tool_spec_too_large`（413）或 `input_too_large`（413）。
+`/compact` 不会减少工具 Schema 的大小。超大工具列表还会增加 SDK Prompt Token、
+延迟和实际 AI TOKEN 扣费；只在非敏感临时工程中测试。
+
 默认仍不允许工具执行；开启实验模式需要 `IOA_BRIDGE_EXPERIMENTAL_TOOLS=1`。
-工具模式采用 JSON Prompt 适配，**不是原生 Function Calling**，须在非敏感项目里验证。
+工具模式采用 JSON Prompt 适配，**不是原生 Function Calling**。
 
 ## Magpie 接入
 
