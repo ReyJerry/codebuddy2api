@@ -47,7 +47,8 @@ class SDKBackend:
             tools=[],              # Deliberately omit built-in tool *definitions*.
             allowed_tools=[],
             can_use_tool=_deny_all_tools,
-            permission_mode="plan",
+            # Codex owns file-edit approval. SDK must not inject plan-only instructions.
+            permission_mode="default",
             max_turns=1,
             cwd=str(self.cwd),     # A stable, isolated directory; no project configs.
             setting_sources=[],

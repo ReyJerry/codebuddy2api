@@ -211,3 +211,9 @@ uv run --locked python -B -m pytest -q tests/test_ioa_bridge.py
 - 不要开放公网访问；独立服务强制绑定 loopback。
 - 本项目不读取或修改原网关 Credits，也不伪造员工账单和内部身份。
 - `IOA_BRIDGE_MODELS` 是你的本地模型白名单，不是访问权限证明。
+
+### Codex App 默认模式与 SDK 规划模式
+
+SDK `permission_mode` 使用 `default`，避免将 SDK 的“仅规划、禁止修改”限制注入模型对 Codex 工具的决策。桥接仍保持 `tools=[]`、`allowed_tools=[]` 以及一律拒绝 SDK 本地工具执行的回调；**实际文件操作和审批仍由 Codex App 负责**。
+
+在 Codex App Default 模式中，`request_user_input` 工具可能不可用；如需确认权限，请让模型通过普通文本提问。测试编辑操作时，只授权非敏感临时工作区，不要直接在真实项目上试验。

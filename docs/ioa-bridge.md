@@ -159,3 +159,7 @@ The tests use synthetic model responses; no network, corporate credentials,
 or AI TOKEN consumption. Operate the bridge only where corporate policy allows
 such a client and data flow. Keep localhost binding, never share keys/logs, and
 never place private endpoint configuration in a public repository.
+
+### Codex App default mode versus SDK plan mode
+
+The SDK now uses `permission_mode="default"` to avoid injecting read-only plan-mode instructions into Codex tool generation. SDK native tools remain disabled (`tools=[]`, `allowed_tools=[]`, deny-all callback); **Codex App remains responsible for execution and approvals**. `request_user_input` can be unavailable in Codex Default mode; use a plain assistant message to request clarification. Test edits only in a disposable non-sensitive workspace.

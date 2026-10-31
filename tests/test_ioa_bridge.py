@@ -261,6 +261,8 @@ def test_sdk_options_disable_tools_and_keep_stable_cwd(monkeypatch, tmp_path):
                     "output_tokens": 4, "cache_read_input_tokens": 0},
                     "num_turns": 2, "api_duration_ms": 3140})]
     assert captured["tools"] == [] and captured["max_turns"] == 1
+    assert captured["permission_mode"] == "default"  # no SDK plan-only restriction
+    assert captured["allowed_tools"] == [] and callable(captured["can_use_tool"])
     assert captured["cwd"] == str(tmp_path)
     assert captured["setting_sources"] == []
     assert captured["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"] == "ioa"
