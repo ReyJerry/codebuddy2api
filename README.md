@@ -107,3 +107,8 @@ For personal learning only — no commercial use. Not affiliated with Tencent, W
 ## Community
 
 Thanks to the [LINUX DO](https://linux.do) community for providing an open and friendly platform for technical discussions.
+
+
+## Optional CodeBuddy iOA Agent SDK bridge (experimental)
+
+An isolated, local-only OpenAI Responses facade using the **official CodeBuddy Agent SDK** is available in [`ioa_bridge/`](ioa_bridge/). It uses the iOA API Key, not this gateway's SaaS credential pool or Credits ledger. Text / SSE are available; Codex tool calls are **experimental and disabled by default**. See [English setup](docs/ioa-bridge.md) and [中文说明](docs/ioa-bridge.zh-CN.md). Only use in an authorized environment. Do not commit credentials.

@@ -107,3 +107,8 @@ Compose 默认拉取 `latest`（`CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebu
 ## 社区
 
 感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
+
+
+## 可选：CodeBuddy iOA Agent SDK 本地桥接（实验功能）
+
+[`ioa_bridge/`](ioa_bridge/) 使用**官方 CodeBuddy Agent SDK 和独立的 iOA API Key**，在本机提供 OpenAI Responses 文本/SSE 接口，不读取本项目原有 SaaS 凭据或 Credits 账本。Codex 工具调用属于**实验功能，默认关闭**。安装及限制详见[中文指南](docs/ioa-bridge.zh-CN.md)和[英文指南](docs/ioa-bridge.md)。仅在取得授权的环境中使用，不要提交任何凭据。
