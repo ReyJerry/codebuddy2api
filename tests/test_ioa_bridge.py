@@ -265,3 +265,75 @@ def test_sdk_options_disable_tools_and_keep_stable_cwd(monkeypatch, tmp_path):
     assert captured["setting_sources"] == []
     assert captured["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"] == "ioa"
     assert captured["persist_session"] is False
+
+
+def test_long_history_above_old_two_mb_and_250k_chars_passes_without_truncation():
+    c, backend = client()
+    # Previous versions rejected this with HTTP 413 before reaching the SDK.
+    huge_history = "a" * 2_200_000
+    response = c.post("/v1/responses", headers=headers(),
+                      json={"model": "demo-model", "input": huge_history})
+    assert response.status_code == 200, response.text[:300]
+    assert len(backend.calls) == 1
+    assert huge_history in backend.calls[0][0]
+    assert len(backend.calls[0][0]) > 250_000
+
+
+def test_body_size_limit_is_enforced_before_sdk_for_content_length_and_chunked():
+    c, backend = client()
+    app = create_app(settings=Settings("z" * 32, "secret", Path("/tmp"), False,
+                                       max_body_bytes=2048), backend=backend, catalog=FakeCatalog())
+    c = TestClient(app)
+    large = {"model": "demo-model", "input": "x" * 3000}
+    r = c.post("/v1/responses", headers=headers(), json=large)
+    assert r.status_code == 413 and r.json()["error"]["code"] == "input_too_large"
+    payload = json.dumps(large).encode()
+    chunks = (payload[i:i + 400] for i in range(0, len(payload), 400))
+    r2 = c.post("/v1/responses", headers={**headers(), "Content-Type": "application/json"},
+                content=chunks)
+    assert r2.status_code == 413 and r2.json()["error"]["code"] == "input_too_large"
+    assert not backend.calls
+
+
+def test_prompt_chars_limit_is_distinct_from_request_bytes():
+    backend = FakeBackend()
+    settings = Settings("z" * 32, "secret", Path("/tmp"), False,
+                        max_body_bytes=1_000_000, max_prompt_chars=200)
+    c = TestClient(create_app(settings=settings, backend=backend, catalog=FakeCatalog()))
+    r = c.post("/v1/responses", headers=headers(),
+               json={"model": "demo-model", "input": "Z" * 400})
+    assert r.status_code == 413 and r.json()["error"]["code"] == "input_too_large"
+    assert not backend.calls
+
+
+def test_tool_instructions_count_against_total_prompt_ceiling():
+    backend = FakeBackend()
+    settings = Settings("z" * 32, "secret", Path("/tmp"), True,
+                        max_body_bytes=1_000_000, max_prompt_chars=500)
+    c = TestClient(create_app(settings=settings, backend=backend, catalog=FakeCatalog()))
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "x" * 200,
+        "tools": [{"type": "function", "name": "shell_command", "parameters": {"type": "object"}}]})
+    assert r.status_code == 413 and r.json()["error"]["code"] == "input_too_large"
+    assert not backend.calls
+
+
+def test_settings_long_context_defaults_and_env_overrides(monkeypatch, tmp_path):
+    env = {"IOA_BRIDGE_KEY": "z" * 32, "CODEBUDDY_API_KEY": "secret",
+           "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa", "IOA_BRIDGE_CWD": str(tmp_path)}
+    with patch.dict(os.environ, env, clear=True):
+        settings = Settings.from_env()
+        assert settings.max_body_bytes == 128 * 1024 * 1024
+        assert settings.max_prompt_chars == 16_000_000
+    with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_BODY_MB": "256",
+                                      "IOA_BRIDGE_MAX_PROMPT_CHARS": "32000000"}, clear=True):
+        settings = Settings.from_env()
+        assert settings.max_body_bytes == 256 * 1024 * 1024
+        assert settings.max_prompt_chars == 32_000_000
+    for bad in ("0", "512", "not-an-integer"):
+        with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_BODY_MB": bad}, clear=True):
+            with pytest.raises(RuntimeError):
+                Settings.from_env()
+    with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_PROMPT_CHARS": "36000000"}, clear=True):
+        with pytest.raises(RuntimeError):
+            Settings.from_env()

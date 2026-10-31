@@ -14,11 +14,43 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import ModelCatalog
-from .core import (BridgeError, MODEL_ID, conversation_prompt, encode_sse,
+from .core import (BridgeError, MAX_INPUT_CHARS, MODEL_ID, conversation_prompt, encode_sse,
                    event, new_response, parse_tool_answer, response_usage,
                    tool_prompt, validate_tools)
 from .sdk_backend import SDKBackend
 from .sessions import SessionManager, is_single_delta
+
+
+DEFAULT_MAX_BODY_MB = 128  # Large enough for typical 1M-token text histories (not a token guarantee).
+MAX_CONFIG_BODY_MB = 256
+MAX_CONFIG_PROMPT_CHARS = 32_000_000
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        number = int(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"{name} 必须是整数") from None
+    if not minimum <= number <= maximum:
+        raise RuntimeError(f"{name} 必须介于 {minimum} 与 {maximum} 之间")
+    return number
+
+
+async def _read_body_limited(request: Request, limit: int) -> bytearray:
+    """Enforce byte limit before materializing the request (even for chunked bodies)."""
+    size_header = request.headers.get("content-length", "")
+    if size_header.isascii() and size_header.isdigit():
+        if len(size_header) > 18 or int(size_header) > limit:
+            raise BridgeError("input_too_large", "请求体超过本地字节限制；请压缩历史或调整 IOA_BRIDGE_MAX_BODY_MB", 413)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > limit - len(body):
+            raise BridgeError("input_too_large", "请求体超过本地字节限制；请压缩历史或调整 IOA_BRIDGE_MAX_BODY_MB", 413)
+        body.extend(chunk)
+    return body
 
 
 @dataclass(frozen=True)
@@ -27,7 +59,8 @@ class Settings:
     api_key: str
     cwd: Path
     experimental_tools: bool = False
-    max_body_bytes: int = 2_000_000
+    max_body_bytes: int = DEFAULT_MAX_BODY_MB * 1024 * 1024
+    max_prompt_chars: int = MAX_INPUT_CHARS
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -43,7 +76,10 @@ class Settings:
             raise RuntimeError("检测到 CODEBUDDY_AUTH_TOKEN；请取消该环境变量以避免覆盖 API Key")
         cwd = Path(os.getenv("IOA_BRIDGE_CWD", "~/.cache/codebuddy2api/ioa-bridge")).expanduser().resolve()
         cwd.mkdir(parents=True, exist_ok=True)
-        return cls(key, api_key, cwd, os.getenv("IOA_BRIDGE_EXPERIMENTAL_TOOLS") == "1")
+        mb = _env_int("IOA_BRIDGE_MAX_BODY_MB", DEFAULT_MAX_BODY_MB, 1, MAX_CONFIG_BODY_MB)
+        chars = _env_int("IOA_BRIDGE_MAX_PROMPT_CHARS", MAX_INPUT_CHARS, 100_000, MAX_CONFIG_PROMPT_CHARS)
+        return cls(key, api_key, cwd, os.getenv("IOA_BRIDGE_EXPERIMENTAL_TOOLS") == "1",
+                   mb * 1024 * 1024, chars)
 
 
 def _error(err: BridgeError) -> JSONResponse:
@@ -157,9 +193,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
         if not _authorized(request, settings.bridge_key):
             return _error(BridgeError("invalid_api_key", "无效的本地桥接密钥", 401))
         try:
-            raw = await request.body()
-            if len(raw) > settings.max_body_bytes:
-                raise BridgeError("input_too_large", "请求体超过本地限制", 413)
+            raw = await _read_body_limited(request, settings.max_body_bytes)
             try:
                 body = json.loads(raw)
             except (ValueError, UnicodeDecodeError):
@@ -183,9 +217,13 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                 raise BridgeError("unsupported_history", "不支持服务端 previous_response_id；请发送完整 input 历史", 422)
             if body.get("background"):
                 raise BridgeError("unsupported_background", "不支持后台执行", 422)
-            prompt = conversation_prompt(body, tools=requested_tools)
+            prompt = conversation_prompt(body, tools=requested_tools,
+                                         max_chars=settings.max_prompt_chars)
             if requested_tools:
                 prompt = tool_prompt(prompt, requested_tools, choice)
+                # Tool schema and instructions also consume context; never silently truncate.
+                if len(prompt) > settings.max_prompt_chars:
+                    raise BridgeError("input_too_large", "工具说明和历史合并后超过本地字符限制", 413)
             stream = body.get("stream", False)
             if not isinstance(stream, bool):
                 raise BridgeError("invalid_stream", "stream 必须为布尔值", 422)

@@ -91,6 +91,28 @@ curl -sS http://127.0.0.1:8791/v1/responses \
 如果 CLI help 格式不同而返回空模型目录，通过 `IOA_BRIDGE_MODELS` 指定
 自己已确认可用的 ID；这不更改服务端权限。
 
+## 大上下文支持：1M Token 模型与本地 HTTP 上限
+
+为允许恢复长 Codex Session，桥接器现在默认接收 **128 MiB HTTP 请求体**，且转换后
+Prompt 的本地上限为 **16,000,000 字符**（旧版分别约 2 MB 和 250,000 字符）。
+这两个阈值只是桥接器的容量保护，**不是模型的 1M Token 上下文承诺**。
+Token 与字符、UTF-8/JSON 字节并不相同；SDK 会另外注入系统上下文，实际窗口由
+所用模型和服务端决定。桥接器绝不因为大小问题静默裁剪历史。
+
+如需更大，可以在**启动桥接的那个终端**设置以下环境变量并重启（合法范围：
+HTTP 1–256 MiB；Prompt 100,000–32,000,000 字符）：
+
+```bash
+export IOA_BRIDGE_MAX_BODY_MB=256
+export IOA_BRIDGE_MAX_PROMPT_CHARS=32000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+默认值可以不设置；较大的上限只改变本机接收能力，不会绕过 Magpie 自身的限制或
+模型实际 1M Token 窗口。如果 Magpie 或 SDK 上游另有上限，仍可能收到不同的错误。
+对于极长历史先估算实际 Token、检查 AI TOKEN 扣费，避免重复发送大 Prompt。
+内部使用 `request.stream()` 逐块接收并在超出阈值时立即拒绝，避免无限制缓冲。
+
 ## Magpie 接入
 
 在 Magpie 添加 **Custom / OpenAI Responses Provider**：

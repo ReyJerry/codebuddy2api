@@ -56,6 +56,28 @@ curl -H "Authorization: Bearer $IOA_BRIDGE_KEY" \
   http://127.0.0.1:8791/v1/responses
 ```
 
+## Long context: 1M-token models versus local HTTP limits
+
+To support resumed Codex sessions, the bridge now defaults to a **128 MiB request-body**
+limit and a **16,000,000-character converted-prompt** limit (previously about 2 MB
+and 250,000 characters). These are *local capacity ceilings*, not a guarantee that
+an upstream model will accept 1M tokens. Token counts differ from UTF-8 bytes and
+characters, and the SDK inserts additional system context. No truncation occurs.
+
+If needed, set the following in the **bridge process environment**, then restart:
+
+```bash
+export IOA_BRIDGE_MAX_BODY_MB=256
+export IOA_BRIDGE_MAX_PROMPT_CHARS=32000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+Allowed values: `IOA_BRIDGE_MAX_BODY_MB` 1–256 (MiB); `IOA_BRIDGE_MAX_PROMPT_CHARS`
+100,000–32,000,000. Unset values use the defaults. Raising these values does not
+bypass Magpie's own limits or the model's actual context window. Extremely long
+histories may incur significant upstream usage. Request bytes are read incrementally
+with early rejection once the configured limit is reached.
+
 ## Magpie / Codex
 
 Add a Custom OpenAI Responses provider in Magpie:

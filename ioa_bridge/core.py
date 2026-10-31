@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-MAX_INPUT_CHARS = 250_000
+MAX_INPUT_CHARS = 16_000_000  # Local character ceiling, NOT a model token limit.
 MAX_TOOLS = 64
 MAX_TOOL_SPEC_CHARS = 24_000
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -105,7 +105,8 @@ def validate_tools(value: Any) -> list[dict[str, Any]]:
     return out
 
 
-def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]]) -> str:
+def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
+                        max_chars: int = MAX_INPUT_CHARS) -> str:
     """Flatten OpenAI Responses history without executing any tools in the bridge."""
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
@@ -150,8 +151,8 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]]) ->
     if not parts:
         raise BridgeError("unsupported_input", "缺少可发送的文本消息", 422)
     prompt = "\n\n".join(parts)
-    if len(prompt) > MAX_INPUT_CHARS:
-        raise BridgeError("input_too_large", "输入超过本地字符限制", 413)
+    if len(prompt) > max_chars:
+        raise BridgeError("input_too_large", "转换后提示词超过本地字符限制；请压缩历史或调整 IOA_BRIDGE_MAX_PROMPT_CHARS", 413)
     return prompt
 
 
