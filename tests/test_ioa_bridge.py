@@ -452,7 +452,7 @@ def test_distinct_tool_shape_duplicate_and_type_errors():
         ({"type": "function"}, "invalid_tools_shape"),
         ("tool", "invalid_tools_shape"),
         (["not-an-object"], "invalid_tool_entry"),
-        ([{"type": "web_search", "name": "hosted"}], "unsupported_tool_type"),
+        ([{"type": "file_search", "vector_store_ids": ["vs_abc"]}], "unsupported_tool_type"),
         (_many_codex_tools(1) * 2, "duplicate_tool_name"),
     ]:
         r = c.post("/v1/responses", headers=headers(), json={
@@ -498,3 +498,211 @@ def test_large_tool_budget_env_override(tmp_path):
     with patch.dict(os.environ, {**env, "IOA_BRIDGE_MAX_TOOL_SPEC_CHARS": "32000001"}, clear=True):
         with pytest.raises(RuntimeError):
             Settings.from_env()
+
+
+def _codex_new_tools():
+    """Modern Codex request: function/custom + namespace + web + discovery."""
+    return [
+        {"type": "function", "name": "exec_command", "description": "run command",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
+        {"type": "namespace", "name": "mcp__demo__", "description": "test deferred tools", "tools": [
+            {"type": "function", "name": "list_events", "defer_loading": True,
+             "description": "list calendar events", "parameters": {"type": "object", "properties": {}}},
+            {"type": "custom", "name": "freeform", "format": {"type": "text"}},
+        ]},
+        {"type": "web_search", "external_web_access": False},
+        {"type": "tool_search", "execution": "client", "description": "Search deferred tools",
+         "parameters": {"type": "object", "properties": {
+             "query": {"type": "string"}, "limit": {"type": "number"}}, "required": ["query"]}},
+    ]
+
+
+def test_codex_mixed_tools_client_tool_search_json_and_metadata():
+    tools = _codex_new_tools()
+    answer = '{"kind":"tool_search_call","arguments":{"query":"calendar events","limit":8}}'
+    c, b = client(FakeBackend(answer), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "find calendar tools", "tools": tools})
+    assert r.status_code == 200, r.text
+    value = r.json()
+    item = value["output"][0]
+    assert item["type"] == "tool_search_call"
+    assert item["execution"] == "client" and item["call_id"].startswith("call_")
+    assert item["arguments"] == {"query": "calendar events", "limit": 8}
+    assert value["metadata"]["ioa_unavailable_hosted_tools"] == "web_search"
+    assert "web_search" in b.calls[0][0]
+    assert "NOT available" in b.calls[0][0]
+    assert '"namespace": "mcp__demo__"' in b.calls[0][0]
+    assert '"type": "tool_search"' in b.calls[0][0]
+
+
+def test_codex_client_tool_search_sse_item_and_followup_handoff():
+    tools = _codex_new_tools()
+    answer = '{"kind":"tool_search_call","arguments":{"query":"calendar events"}}'
+    c, _ = client(FakeBackend(answer), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "discover", "tools": tools, "stream": True})
+    assert r.status_code == 200, r.text
+    data = [json.loads(x[6:]) for x in r.text.splitlines() if x.startswith("data: {")]
+    tool = next(x["item"] for x in data if x.get("type") == "response.output_item.done")
+    assert tool["type"] == "tool_search_call" and tool["execution"] == "client"
+    assert tool["arguments"]["query"] == "calendar events"
+    assert data[-1]["response"]["metadata"]["ioa_unavailable_hosted_tools"] == "web_search"
+    assert r.text.endswith("data: [DONE]\n\n")
+
+    followup = [
+        {"role": "user", "content": "find calendar tools"},
+        tool,
+        {"type": "tool_search_output", "execution": "client", "call_id": tool["call_id"],
+         "status": "completed", "tools": [tools[2]]},
+    ]
+    answer2 = '{"kind":"tool_call","namespace":"mcp__demo__","name":"list_events","arguments":{}}'
+    c2, b2 = client(FakeBackend(answer2), tools=True)
+    r2 = c2.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": followup, "tools": tools})
+    assert r2.status_code == 200, r2.text
+    tool2 = r2.json()["output"][0]
+    assert tool2["type"] == "function_call"
+    assert tool2["namespace"] == "mcp__demo__" and tool2["name"] == "list_events"
+    assert tool2["arguments"] == "{}"
+    assert "tool_search_result" in b2.calls[0][0]
+    assert "previous_tool_search" in b2.calls[0][0]
+
+    # The Codex client can send tool execution results in a later request.
+    followup.extend([tool2, {"type": "function_call_output", "call_id": tool2["call_id"],
+                             "output": '{"events":[]}'}])
+    c3, b3 = client(FakeBackend('{"kind":"message","text":"No events"}'), tools=True)
+    r3 = c3.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": followup, "tools": tools})
+    assert r3.status_code == 200, r3.text
+    assert r3.json()["output"][0]["content"][0]["text"] == "No events"
+    assert "tool_result" in b3.calls[0][0]
+
+
+def test_web_search_is_explicitly_unavailable_not_fabricated_or_ignored():
+    c, b = client(FakeBackend('{"kind":"message","text":"Live web search is unavailable"}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "What's the latest?",
+        "tools": [{"type": "web_search"}]})
+    assert r.status_code == 200, r.text
+    assert r.json()["metadata"]["ioa_unavailable_hosted_tools"] == "web_search"
+    assert "NOT available" in b.calls[0][0]
+    assert r.json()["output"][0]["content"][0]["text"] == "Live web search is unavailable"
+    # Forced hosted tools are explicitly rejected before SDK call.
+    r2 = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "Search now", "tool_choice": {"type": "web_search"},
+        "tools": [{"type": "web_search"}]})
+    assert r2.status_code == 422 and r2.json()["error"]["code"] == "hosted_tool_unavailable"
+    assert len(b.calls) == 1
+
+
+def test_discovery_rejects_server_execution_and_malformed_args():
+    tools = _codex_new_tools()
+    tools[-1] = {**tools[-1], "execution": "server"}
+    c, b = client(tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "discover", "tools": tools})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "unsupported_hosted_tool"
+    assert not b.calls
+
+    for answer in [
+        '{"kind":"tool_search_call","arguments":{"query":""}}',
+        '{"kind":"tool_search_call","arguments":{"query":"q","limit":0}}',
+        '{"kind":"tool_search_call","arguments":{"query":"q","limit":true}}',
+        '{"kind":"tool_search_call","arguments":{"query":"q","limit":200}}',
+    ]:
+        c2, _ = client(FakeBackend(answer), tools=True)
+        r2 = c2.post("/v1/responses", headers=headers(), json={
+            "model": "demo-model", "input": "discover", "tools": _codex_new_tools()})
+        assert r2.status_code == 502 and r2.json()["error"]["code"] == "tool_protocol_error"
+
+
+def test_named_tool_collisions_and_namespaced_custom_calls():
+    tools = [
+        {"type": "namespace", "name": "alpha", "tools": [
+            {"type": "custom", "name": "run", "format": {"type": "text"}}]},
+        {"type": "namespace", "name": "beta", "tools": [
+            {"type": "custom", "name": "run", "format": {"type": "text"}}]},
+    ]
+    assert len(validate_tools(tools)) == 2
+    c, _ = client(FakeBackend('{"kind":"tool_call","namespace":"beta","name":"run","input":"hello"}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "run", "tools": tools})
+    assert r.status_code == 200, r.text
+    item = r.json()["output"][0]
+    assert item["type"] == "custom_tool_call" and item["namespace"] == "beta"
+    c2, _ = client(FakeBackend('{"kind":"tool_call","name":"run","input":"hello"}'), tools=True)
+    r2 = c2.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "run", "tools": tools})
+    assert r2.status_code == 502 and r2.json()["error"]["code"] == "tool_protocol_error"
+
+
+def test_tool_search_history_accepts_stringified_args_and_rejects_malformed():
+    t = _codex_new_tools()
+    c, b = client(FakeBackend('{"kind":"message","text":"OK"}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "tools": t,
+        "input": [
+            {"type": "tool_search_call", "call_id": "call_abc", "execution": "client",
+             "arguments": '{"query":"list tools"}'},
+            {"type": "tool_search_output", "call_id": "call_abc", "execution": "client",
+             "tools": [t[2]]},
+            {"role": "user", "content": "continue"},
+        ]})
+    assert r.status_code == 200, r.text
+    assert "list tools" in b.calls[0][0]
+    assert "tool_search_result" in b.calls[0][0]
+    r2 = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "tools": t,
+        "input": [{"type": "tool_search_call", "call_id": "call_abc", "arguments": "not json"}]})
+    assert r2.status_code == 422
+
+
+def test_deferred_namespace_tool_cannot_be_called_before_discovery():
+    tools = _codex_new_tools()
+    shortcut = '{"kind":"tool_call","namespace":"mcp__demo__","name":"list_events","arguments":{}}'
+    c, b = client(FakeBackend(shortcut), tools=True)
+    result = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "read events", "tools": tools})
+    assert result.status_code == 502
+    assert result.json()["error"]["code"] == "tool_protocol_error"
+    first_prompt = b.calls[0][0]
+    assert "Deferred tools (must use tool_search before calling)" in first_prompt
+    assert "list_events" in first_prompt
+    assert '"type": "tool_search"' in first_prompt
+    # The deferred tool is previewed without its full parameter schema.
+    assert '"name": "list_events", "description": "list calendar events"' not in first_prompt
+
+    loaded = [{"role": "user", "content": "read events"},
+              {"type": "tool_search_output", "call_id": "call_find", "execution": "client",
+               "tools": [tools[2]]}]
+    c2, _ = client(FakeBackend(shortcut), tools=True)
+    r2 = c2.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": loaded, "tools": tools})
+    assert r2.status_code == 200
+    assert r2.json()["output"][0]["namespace"] == "mcp__demo__"
+
+
+def test_tool_choice_required_hosted_only_rejects_before_paid_backend():
+    c, b = client(FakeBackend('{"kind":"message","text":"OK"}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "search", "tool_choice": "required",
+        "tools": [{"type": "web_search"}]})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "hosted_tool_unavailable"
+    assert not b.calls
+
+
+def test_exact_fifth_tool_web_search_does_not_break_coding_request():
+    base = [{"type": "function", "name": f"tool_{i}",
+             "parameters": {"type": "object", "properties": {}}} for i in range(4)]
+    base.append({"type": "web_search", "external_web_access": False})
+    c, b = client(FakeBackend('{"kind":"tool_call","name":"tool_1","arguments":{}}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "run a coding tool", "tools": base})
+    assert r.status_code == 200, r.text
+    assert r.json()["output"][0]["type"] == "function_call"
+    assert r.json()["metadata"]["ioa_unavailable_hosted_tools"] == "web_search"
+    assert "NOT available" in b.calls[0][0]

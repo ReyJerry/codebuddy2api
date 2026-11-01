@@ -171,3 +171,29 @@ never place private endpoint configuration in a public repository.
 ### Codex App default mode versus SDK plan mode
 
 The SDK now uses `permission_mode="default"` to avoid injecting read-only plan-mode instructions into Codex tool generation. SDK native tools remain disabled (`tools=[]`, `allowed_tools=[]`, deny-all callback); **Codex App remains responsible for execution and approvals**. `request_user_input` can be unavailable in Codex Default mode; use a plain assistant message to request clarification. Test edits only in a disposable non-sensitive workspace.
+
+
+## Modern Codex Responses tool declarations (experimental, Nov 2026)
+
+Codex may now send `function`, `custom`, `namespace`, client-executed
+`tool_search`, and `web_search` in the same `tools` array. These are not interchangeable.
+
+- `function`/`custom`: existing experimental prompt-JSON to Responses tool call adapter.
+- `namespace`: preserve the `namespace` field in function/custom tool calls; permit
+  same names across different namespaces.
+- `tool_search` with `execution=client`: emit a real Responses `tool_search_call`
+  containing an **object** `arguments` field, so Codex performs discovery.
+  Accept `tool_search_output` in subsequent history. Deferred tools cannot be called
+  before their discovery has been returned. This is still a prompt-based adapter,
+  not native hosted OpenAI tool search.
+- `web_search`/`web_search_preview`: **not implemented** by this CodeBuddy bridge.
+  They are explicitly marked unavailable in response metadata
+  (`ioa_unavailable_hosted_tools`) and in the model prompt; live results/citations
+  must never be fabricated. Forced hosted search fails as `422 hosted_tool_unavailable`.
+  Use another authorized tool or a provider with native hosted web search when needed.
+- Other unknown/hosted types fail with `422 unsupported_tool_type`, identifying
+  their JSON index and type. Tool declarations are never secretly discarded.
+
+The reported `tools[4]` denotes an array index, **not** a known tool kind.
+Re-verify tool discovery, namespace calls, and client Shell/Patch execution with
+real Codex App versions before use with important data.

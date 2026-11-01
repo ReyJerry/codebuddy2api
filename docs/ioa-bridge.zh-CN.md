@@ -224,3 +224,31 @@ uv run --locked python -B -m pytest -q tests/test_ioa_bridge.py
 SDK `permission_mode` 使用 `default`，避免将 SDK 的“仅规划、禁止修改”限制注入模型对 Codex 工具的决策。桥接仍保持 `tools=[]`、`allowed_tools=[]` 以及一律拒绝 SDK 本地工具执行的回调；**实际文件操作和审批仍由 Codex App 负责**。
 
 在 Codex App Default 模式中，`request_user_input` 工具可能不可用；如需确认权限，请让模型通过普通文本提问。测试编辑操作时，只授权非敏感临时工作区，不要直接在真实项目上试验。
+
+
+## Codex 新式工具声明（2026-11，实验兼容）
+
+Codex 现在可能在 Responses `tools` 中同时提交 `function`、`custom`、
+`namespace`、`tool_search`（`execution=client`）及 `web_search`。
+新版桥接区分它们，不再把 `tools[4]` 一概视为未知工具：
+
+- **function/custom**：维持已验证的 Prompt JSON → Responses 工具调用协议。
+- **namespace**：保留工具所属命名空间，发出带 `namespace` 的 `function_call`/
+  `custom_tool_call`，支持同名但不同命名空间的工具。
+- **tool_search（client）**：产生真正类型为 `tool_search_call`、`execution=client`、
+  `arguments` 为对象的 Responses 项目，交给 Codex 客户端执行工具发现。
+  `tool_search_output` 会在下一轮进入模型上下文。`defer_loading` 的工具在被发现之前
+  不允许直接调用（仍属实验性 Prompt 适配；不是 OpenAI 原生工具搜索后端）。
+- **web_search/web_search_preview**：这是由服务商执行的托管联网搜索，
+  目前 CodeBuddy SDK 桥接**没有实现联网搜索**。为了不阻断普通编码请求，
+  它们作为明确的**不可用能力**记录在 `metadata.ioa_unavailable_hosted_tools`，
+  并明确告知模型不得编造联网结果或引用。若 `tool_choice` 强制搜索，会返回
+  `422 hosted_tool_unavailable`。这不是支持联网搜索；需要实际联网搜索时应使用
+  经授权的其他工具或支持该托管功能的后端。
+- **其他托管或新工具类型**：显式返回 `422 unsupported_tool_type`，消息包含工具
+  位置和类型，不会假装执行、丢弃或任意转成 Shell。
+
+`tools[4]` 只是 JSON 数组的第 5 个工具位置，**不等于某一种固定类型**。
+如仍发生类型问题，先记录不含密钥/参数的工具 `type`，再决定是否能安全兼容。
+上述修改不能保证所有新版本 Codex App/Magpie 的协议完全一致；在用于实际项目之前，
+应测试 `tool_search_call`、命名空间调用、工具返回和 Shell/Patch 全闭环。

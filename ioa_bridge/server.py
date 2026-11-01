@@ -14,8 +14,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import ModelCatalog
-from .core import (BridgeError, MAX_INPUT_CHARS, MAX_TOOL_SPEC_CHARS, MODEL_ID, conversation_prompt, encode_sse,
-                   event, new_response, parse_tool_answer, response_usage,
+from .core import (BridgeError, MAX_INPUT_CHARS, MAX_TOOL_SPEC_CHARS, MODEL_ID, active_tools_for_turn,
+                   conversation_prompt, encode_sse, event, new_response, parse_tool_answer, response_usage,
                    tool_prompt, validate_tools)
 from .sdk_backend import SDKBackend
 from .sessions import SessionManager, is_single_delta
@@ -103,8 +103,11 @@ def _output_text(answer: str) -> dict[str, Any]:
             "status": "completed", "content": [{"type": "output_text", "text": answer, "annotations": []}]}
 
 
-def _output_call(kind: str, payload: dict[str, str]) -> dict[str, Any]:
+def _output_call(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     call_id = "call_" + uuid.uuid4().hex
+    if kind == "tool_search_call":
+        return {"id": "tsc_" + uuid.uuid4().hex, "type": kind,
+                "status": "completed", "call_id": call_id, **payload}
     prefix = "fc_" if kind == "function_call" else "ctc_"
     return {"id": prefix + uuid.uuid4().hex, "type": kind, "status": "completed",
             "call_id": call_id, **payload}
@@ -114,10 +117,10 @@ def _response_metadata(response: dict[str, Any], raw_usage: dict[str, int]) -> N
     response["usage"] = response_usage(raw_usage)
     # The SDK's dollar cost is not the company's RMB bill. Preserve the two
     # cache counters as informative vendor metadata, never as monetary amounts.
-    response["metadata"] = {
+    response.setdefault("metadata", {}).update({
         "ioa_cache_creation_tokens": str(raw_usage.get("cache_creation_input_tokens", 0)),
         "ioa_cache_read_tokens": str(raw_usage.get("cache_read_input_tokens", 0)),
-    }
+    })
 
 
 def _text_events(item: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -148,6 +151,13 @@ def _text_events(item: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
 
 def _tool_events(item: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     idx = 0
+    if item["type"] == "tool_search_call":
+        return [
+            ("response.output_item.added", event("response.output_item.added", {},
+                                                  output_index=idx, item={**item, "status": "in_progress"})),
+            ("response.output_item.done", event("response.output_item.done", {},
+                                                 output_index=idx, item=item)),
+        ]
     base = {"item_id": item["id"], "output_index": idx}
     if item["type"] == "function_call":
         value, prefix = item["arguments"], "response.function_call_arguments"
@@ -224,6 +234,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                                       "此桥接默认不支持 Codex 工具调用；实验模式需显式开启", 422)
                 tools = validate_tools(raw_tools, max_chars=settings.max_tool_spec_chars)
                 requested_tools = tools if settings.experimental_tools else []
+            active_tools, deferred_previews = active_tools_for_turn(requested_tools, body.get("input"))
             if body.get("previous_response_id"):
                 raise BridgeError("unsupported_history", "不支持服务端 previous_response_id；请发送完整 input 历史", 422)
             if body.get("background"):
@@ -231,7 +242,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
             prompt = conversation_prompt(body, tools=requested_tools,
                                          max_chars=settings.max_prompt_chars)
             if requested_tools:
-                prompt = tool_prompt(prompt, requested_tools, choice)
+                prompt = tool_prompt(prompt, active_tools, choice, deferred=deferred_previews)
                 # Tool schema and instructions also consume context; never silently truncate.
                 if len(prompt) > settings.max_prompt_chars:
                     raise BridgeError("input_too_large", "工具说明和历史合并后超过本地字符限制", 413)
@@ -246,6 +257,13 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
             return _error(err)
 
         response = new_response(model)
+        if requested_tools:
+            unavailable = [t["name"] for t in requested_tools
+                           if t["type"] == "unavailable_hosted"]
+            if unavailable:
+                # Mark advertised but unavailable vendor-hosted capabilities.
+                # These do not become fake tool calls or unsourced citations.
+                response["metadata"] = {"ioa_unavailable_hosted_tools": ",".join(unavailable)}
         async def generate():
             yield "response.created", event("response.created", {}, response={**response, "status": "in_progress"})
             yield "response.in_progress", event("response.in_progress", {}, response={**response, "status": "in_progress"})
@@ -275,7 +293,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                         final_text = payload.get("text") or "".join(collected)
                 sessions.record(session_key, raw_usage)
                 if requested_tools:
-                    mode, data = parse_tool_answer(final_text, requested_tools, choice)
+                    mode, data = parse_tool_answer(final_text, active_tools, choice)
                     if mode == "message":
                         item = _output_text(data)
                         for name, item_event in _text_events(item):

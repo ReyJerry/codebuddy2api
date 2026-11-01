@@ -79,12 +79,18 @@ def _text_content(content: Any) -> str:
     return "\n".join(pieces)
 
 
-def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[dict[str, Any]]:
-    """Validate all Codex tool declarations without an arbitrary 64-tool cutoff.
+# These are optional OpenAI-hosted capabilities, not executable Codex tools.
+# Accept their declarations only as *unavailable* so ordinary coding requests can
+# proceed, while explicitly warning the model and client. No simulated web results.
+_UNAVAILABLE_HOSTED = frozenset({"web_search", "web_search_preview"})
 
-    Enforce a cumulative serialized-character budget incrementally so a huge
-    incoming tool list is rejected before creating an additional huge prompt.
-    Never silently drop tools, their descriptions or parameter schemas.
+
+def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[dict[str, Any]]:
+    """Validate Codex callable, namespace, discovery and optional hosted tools.
+
+    Client-executed tool_search is a distinct Responses item, not a function.
+    Web search is *not* performed by this SDK bridge. Record it as unavailable
+    instead of pretending it is executable or silently removing it.
     """
     if value is None:
         return []
@@ -92,46 +98,148 @@ def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[
         raise BridgeError("invalid_tools_shape", "tools 必须是 JSON 数组；不能是对象或字符串", 422)
 
     out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    # json.dumps(..., ensure_ascii=False) joins list items with ', '.
-    serialized_chars = 2  # opening and closing brackets
-    for index, item in enumerate(value):
-        if not isinstance(item, dict):
-            raise BridgeError("invalid_tool_entry", f"tools[{index}] 必须是 JSON 对象", 422)
+    seen: set[tuple[str, str]] = set()
+    serialized_chars = 2
+
+    def append_spec(spec: dict[str, Any], where: str) -> None:
+        nonlocal serialized_chars
+        key = (spec.get("namespace") or "functions", spec["name"])
+        if key in seen:
+            raise BridgeError("duplicate_tool_name", f"{where} 的工具名称重复：{key[1][:80]}", 422)
+        seen.add(key)
+        size = len(json.dumps(spec, ensure_ascii=False)) + (2 if out else 0)
+        if serialized_chars + size > max_chars:
+            raise BridgeError("tool_spec_too_large",
+                              f"工具声明总长度超过本地 {max_chars} 字符限制；"
+                              "可调整 IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", 413)
+        serialized_chars += size
+        out.append(spec)
+
+    def callable_spec(item: dict[str, Any], where: str,
+                      namespace: str | None = None) -> dict[str, Any]:
         kind = item.get("type")
         if kind not in ("function", "custom"):
             raise BridgeError("unsupported_tool_type",
-                              f"tools[{index}] 类型不受支持；仅允许 function/custom，不支持托管工具", 422)
+                              f"{where} 的 type={str(kind)[:64]!r} 暂不支持", 422)
         name = item.get("name")
         if not isinstance(name, str) or not MODEL_ID.fullmatch(name):
-            raise BridgeError("invalid_tool_name", f"tools[{index}] 的 name 无效", 422)
-        if name in seen:
-            raise BridgeError("duplicate_tool_name", f"tools[{index}] 的工具名称重复", 422)
-        seen.add(name)
-
+            raise BridgeError("invalid_tool_name", f"{where} 的 name 无效", 422)
         description = item.get("description")
         if description is None:
             description = ""
         if not isinstance(description, str):
-            raise BridgeError("invalid_tool_description", f"tools[{index}] 的 description 必须是字符串", 422)
-        spec = {"type": kind, "name": name, "description": description}
+            raise BridgeError("invalid_tool_description", f"{where} 的 description 必须是字符串", 422)
+        spec: dict[str, Any] = {"type": kind, "name": name, "description": description}
+        if namespace:
+            spec["namespace"] = namespace
+        if item.get("defer_loading") is True:
+            spec["defer_loading"] = True
         if kind == "function":
             parameters = item.get("parameters", {"type": "object", "properties": {}})
             if not isinstance(parameters, dict):
-                raise BridgeError("invalid_tool_schema", f"tools[{index}] 的 parameters 必须是对象", 422)
+                raise BridgeError("invalid_tool_schema", f"{where} 的 parameters 必须是对象", 422)
             spec["parameters"] = parameters
         else:
-            spec["format"] = item.get("format", {"type": "text"})
+            fmt = item.get("format", {"type": "text"})
+            if not isinstance(fmt, dict):
+                raise BridgeError("invalid_tool_schema", f"{where} 的 format 必须是对象", 422)
+            spec["format"] = fmt
+        return spec
 
-        if out:
-            serialized_chars += 2  # ', '
-        serialized_chars += len(json.dumps(spec, ensure_ascii=False))
-        if serialized_chars > max_chars:
-            raise BridgeError("tool_spec_too_large",
-                              f"工具声明总长度超过本地 {max_chars} 字符限制；"
-                              "可调整 IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", 413)
-        out.append(spec)
+    for index, item in enumerate(value):
+        where = f"tools[{index}]"
+        if not isinstance(item, dict):
+            raise BridgeError("invalid_tool_entry", f"{where} 必须是 JSON 对象", 422)
+        kind = item.get("type")
+        if kind in ("function", "custom"):
+            append_spec(callable_spec(item, where), where)
+        elif kind == "namespace":
+            namespace = item.get("name")
+            children = item.get("tools")
+            if not isinstance(namespace, str) or not MODEL_ID.fullmatch(namespace):
+                raise BridgeError("invalid_tool_name", f"{where} 的命名空间名称无效", 422)
+            if not isinstance(children, list):
+                raise BridgeError("invalid_tool_schema", f"{where}.tools 必须是数组", 422)
+            for j, child in enumerate(children):
+                child_where = f"{where}.tools[{j}]"
+                if not isinstance(child, dict):
+                    raise BridgeError("invalid_tool_entry", f"{child_where} 必须是 JSON 对象", 422)
+                append_spec(callable_spec(child, child_where, namespace), child_where)
+        elif kind == "tool_search":
+            if item.get("execution") != "client":
+                raise BridgeError("unsupported_hosted_tool",
+                                  f"{where} 的 tool_search 仅支持 execution=client；"
+                                  "CodeBuddy SDK 不具备服务端托管工具搜索", 422)
+            parameters = item.get("parameters")
+            if not isinstance(parameters, dict):
+                raise BridgeError("invalid_tool_schema", f"{where} 的 parameters 必须是对象", 422)
+            description = item.get("description") or "Client tool discovery"
+            if not isinstance(description, str):
+                raise BridgeError("invalid_tool_description", f"{where} 的 description 必须是字符串", 422)
+            append_spec({"type": "tool_search", "name": "tool_search",
+                         "execution": "client", "description": description,
+                         "parameters": parameters}, where)
+        elif kind in _UNAVAILABLE_HOSTED:
+            # Keep an explicit marker in the response and prompt; never claim
+            # to have searched the internet or supplied fresh citations.
+            append_spec({"type": "unavailable_hosted", "name": kind}, where)
+        else:
+            raise BridgeError("unsupported_tool_type",
+                              f"{where} 的 type={str(kind)[:64]!r} 不受此桥接支持；"
+                              "请检查是否为托管工具或新 Codex 工具类型", 422)
     return out
+
+
+
+def active_tools_for_turn(tools: list[dict[str, Any]],
+                          history: Any) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Only expose deferred tools after Codex has returned their discovery.
+
+    The tool-search output is a *description* of client-side discoveries. It
+    cannot grant new execution rights: a tool must still be declared in the
+    current request. A model cannot call a deferred tool before discovery.
+    """
+    if not any(t["type"] == "tool_search" for t in tools):
+        return tools, []  # Existing clients without tool search are unchanged.
+    discovered: set[tuple[str, str]] = set()
+
+    def collect(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") == "namespace" and isinstance(entry.get("tools"), list):
+                namespace = entry.get("name")
+                if not isinstance(namespace, str):
+                    continue
+                for child in entry["tools"]:
+                    if isinstance(child, dict) and child.get("type") in ("function", "custom"):
+                        name = child.get("name")
+                        if isinstance(name, str):
+                            discovered.add((namespace, name))
+            elif entry.get("type") in ("function", "custom"):
+                name, ns = entry.get("name"), entry.get("namespace")
+                if isinstance(name, str):
+                    discovered.add((ns if isinstance(ns, str) else "functions", name))
+
+    if isinstance(history, list):
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") in ("tool_search_output", "additional_tools"):
+                collect(entry.get("tools"))
+
+    active: list[dict[str, Any]] = []
+    deferred: list[dict[str, str]] = []
+    for tool in tools:
+        key = (tool.get("namespace") or "functions", tool["name"])
+        if tool.get("defer_loading") and key not in discovered:
+            deferred.append({"name": tool["name"], "namespace": key[0],
+                             "description": tool["description"]})
+        else:
+            active.append(tool)
+    return active, deferred
 
 
 def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
@@ -162,7 +270,32 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
                 if not isinstance(call_id, str) or not isinstance(name, str):
                     raise BridgeError("unsupported_input", "工具调用历史字段不完整", 422)
                 val = item.get("arguments") if typ == "function_call" else item.get("input")
-                parts.append(f"[previous_tool_call {json.dumps({'call_id':call_id,'name':name,'input':val},ensure_ascii=False)}]")
+                parts.append(f"[previous_tool_call {json.dumps({'call_id':call_id,'name':name,'namespace':item.get('namespace'),'input':val},ensure_ascii=False)}]")
+            elif typ == "tool_search_call":
+                call_id = item.get("call_id")
+                arguments = item.get("arguments")
+                if not isinstance(call_id, str) or not call_id:
+                    raise BridgeError("unsupported_input", "工具搜索调用缺少 call_id", 422)
+                if isinstance(arguments, str):
+                    # Some Codex versions replay arguments as a JSON string.
+                    try:
+                        arguments = json.loads(arguments)
+                    except ValueError:
+                        raise BridgeError("unsupported_input", "工具搜索调用参数不是有效 JSON", 422) from None
+                if not isinstance(arguments, dict):
+                    raise BridgeError("unsupported_input", "工具搜索调用参数必须是对象", 422)
+                parts.append(f"[previous_tool_search call_id={json.dumps(call_id)}]\n"
+                             + json.dumps(arguments, ensure_ascii=False))
+            elif typ == "tool_search_output":
+                call_id, discovered = item.get("call_id"), item.get("tools")
+                if not isinstance(call_id, str) or not isinstance(discovered, list):
+                    raise BridgeError("unsupported_input", "工具搜索结果缺少 call_id 或 tools 数组", 422)
+                parts.append(f"[tool_search_result call_id={json.dumps(call_id)}]\n"
+                             + json.dumps(discovered, ensure_ascii=False))
+            elif typ == "additional_tools":
+                if item.get("role") != "developer" or not isinstance(item.get("tools"), list):
+                    raise BridgeError("unsupported_input", "additional_tools 必须包含 developer 角色及工具数组", 422)
+                parts.append("[additional_tool_declarations]\n" + json.dumps(item["tools"], ensure_ascii=False))
             elif typ in (None, "message"):
                 role = item.get("role")
                 if role not in ("system", "developer", "user", "assistant", "tool"):
@@ -185,37 +318,64 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
     return prompt
 
 
-def tool_prompt(prompt: str, tools: list[dict[str, Any]], choice: Any) -> str:
-    """EXPERIMENTAL: express Codex tools as data in the Agent prompt.
+def tool_prompt(prompt: str, tools: list[dict[str, Any]], choice: Any,
+                deferred: list[dict[str, str]] | None = None) -> str:
+    """Experimental text protocol, including Codex *client* tool discovery.
 
-    Not equivalent to a model-native function calling API. The implementation
-    validates tool name, arguments and turn handoff before emitting a call.
+    Not native OpenAI tool calling. Hosted web_search remains unavailable;
+    it is explicitly reported rather than invented or silently hidden.
     """
+    usable = [t for t in tools if t["type"] != "unavailable_hosted"]
+    unavailable = [t["name"] for t in tools if t["type"] == "unavailable_hosted"]
     rule = (
         "You are the reasoning backend for an external coding agent. "
-        "The external agent alone executes tools, obeying its own user approvals. "
-        "Never claim that you ran a tool. Return EXACTLY one JSON object and no Markdown. "
+        "Only the external Codex client executes tools under its own approvals. "
+        "Return EXACTLY one JSON object, no Markdown. "
         "To answer: {\"kind\":\"message\",\"text\":\"...\"}. "
-        "To request exactly one tool: {\"kind\":\"tool_call\",\"name\":\"tool_name\","
-        "\"arguments\":{...}} for a function tool, or {\"kind\":\"tool_call\","
-        "\"name\":\"tool_name\",\"input\":\"...\"} for a custom tool. "
-        "Never invent tool names or report fabricated tool results. "
-        "If a prior tool result exists, use it to continue."
+        "To call one function: {\"kind\":\"tool_call\",\"name\":\"tool_name\","
+        "\"arguments\":{...}}. "
+        "To call one custom tool: {\"kind\":\"tool_call\","
+        "\"name\":\"tool_name\",\"input\":\"...\"}. "
+        "For a namespaced tool also include \"namespace\":\"namespace_name\". "
+        "For client-executed tool discovery: {\"kind\":\"tool_search_call\","
+        "\"arguments\":{\"query\":\"search terms\",\"limit\":8}}. "
+        "Do not request tool_search_call unless a client tool_search is declared. "
+        "For tools with defer_loading=true, request tool_search_call first. "
+        "Never invent tool names or tool results. If a previous tool result exists, use it."
     )
+    if unavailable:
+        rule += (" IMPORTANT: The following OpenAI-hosted tools were advertised "
+                 "by the client but are NOT available through this CodeBuddy bridge: "
+                 + ", ".join(unavailable)
+                 + ". Do not fabricate web results, file search, citations or current facts. "
+                 "If the user needs them and no other authorized external tool can do so, "
+                 "plainly state that this capability is unavailable.")
     if choice == "required":
-        rule += " You MUST request a tool and not answer in this turn."
+        if not usable:
+            raise BridgeError("hosted_tool_unavailable", "请求必须使用工具，但仅提供未实现的托管工具", 422)
+        rule += " You MUST request an available client tool, not a final answer."
     elif isinstance(choice, dict):
         target = choice.get("name") or (choice.get("function") or {}).get("name")
-        if not isinstance(target, str) or target not in {t["name"] for t in tools}:
-            raise BridgeError("unsupported_tool_choice", "请求了未声明的工具", 422)
-        rule += f" You MUST call the tool named {json.dumps(target)} in this turn."
+        kind = choice.get("type")
+        namespace = choice.get("namespace")
+        if kind == "tool_search" and any(t["type"] == "tool_search" for t in usable):
+            rule += " You MUST request a client tool_search_call, not a final answer."
+        else:
+            if (not isinstance(target, str)
+                    or not any(t["name"] == target and (namespace is None or t.get("namespace") == namespace)
+                               for t in usable)):
+                raise BridgeError("hosted_tool_unavailable", "指定工具不可由客户端执行；此桥接不支持托管工具", 422)
+            rule += f" You MUST call the available client tool named {json.dumps(target)} in this turn."
     elif choice not in (None, "auto", "none"):
         raise BridgeError("unsupported_tool_choice", "不支持当前 tool_choice", 422)
-    return rule + "\nAvailable tools JSON:\n" + json.dumps(tools, ensure_ascii=False) + "\n\nConversation:\n" + prompt
+    preview = ("\nDeferred tools (must use tool_search before calling):\n"
+               + json.dumps(deferred, ensure_ascii=False)) if deferred else ""
+    return (rule + "\nAvailable Codex client tools JSON:\n" + json.dumps(usable, ensure_ascii=False)
+            + preview + "\n\nConversation:\n" + prompt)
 
 
 def parse_tool_answer(answer: str, tools: list[dict[str, Any]], choice: Any) -> tuple[str, Any]:
-    """Strict output validation: malformed tool output is an error, never executable."""
+    """Validate model-generated JSON before handing anything to Codex."""
     try:
         payload = json.loads(answer.strip())
     except (ValueError, TypeError):
@@ -229,22 +389,43 @@ def parse_tool_answer(answer: str, tools: list[dict[str, Any]], choice: Any) -> 
         if not isinstance(text, str):
             raise BridgeError("tool_protocol_error", "模型消息缺少字符串 text", 502)
         return "message", text
+    if payload.get("kind") == "tool_search_call":
+        if not any(t["type"] == "tool_search" and t["execution"] == "client" for t in tools):
+            raise BridgeError("tool_protocol_error", "未声明客户端 tool_search，禁止请求工具搜索", 502)
+        if isinstance(choice, dict) and choice.get("type") != "tool_search":
+            raise BridgeError("tool_protocol_error", "工具搜索不符合 tool_choice", 502)
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            raise BridgeError("tool_protocol_error", "tool_search 参数必须是对象", 502)
+        query, limit = arguments.get("query"), arguments.get("limit")
+        if not isinstance(query, str) or not query.strip() or len(query) > 4096:
+            raise BridgeError("tool_protocol_error", "tool_search query 无效", 502)
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 100):
+            raise BridgeError("tool_protocol_error", "tool_search limit 必须是 1–100 的整数", 502)
+        return "tool_search_call", {"execution": "client", "arguments": arguments}
     if payload.get("kind") != "tool_call":
         raise BridgeError("tool_protocol_error", "模型返回未知工具协议类型", 502)
     name = payload.get("name")
-    tool = next((t for t in tools if t["name"] == name), None)
-    if tool is None or choice == "none":
-        raise BridgeError("tool_protocol_error", "模型请求了未授权或未声明的工具", 502)
+    namespace = payload.get("namespace")
+    if not isinstance(name, str) or (namespace is not None and not isinstance(namespace, str)):
+        raise BridgeError("tool_protocol_error", "工具名称或命名空间无效", 502)
+    matches = [t for t in tools if t["name"] == name and t["type"] in ("function", "custom")
+               and (namespace is None or t.get("namespace") == namespace)]
+    if len(matches) != 1 or choice == "none":
+        raise BridgeError("tool_protocol_error", "模型请求了未授权、未声明或命名空间不明确的工具", 502)
+    tool = matches[0]
     if isinstance(choice, dict):
         wanted = choice.get("name") or (choice.get("function") or {}).get("name")
-        if wanted != name:
+        if wanted != name or (choice.get("namespace") is not None
+                              and choice["namespace"] != tool.get("namespace")):
             raise BridgeError("tool_protocol_error", "模型未调用指定工具", 502)
+    extra = {"namespace": tool["namespace"]} if tool.get("namespace") else {}
     if tool["type"] == "function":
         args = payload.get("arguments")
         if not isinstance(args, dict):
             raise BridgeError("tool_protocol_error", "函数参数必须是 JSON 对象", 502)
-        return "function_call", {"name": name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}
+        return "function_call", {"name": name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":")), **extra}
     val = payload.get("input")
     if not isinstance(val, str):
         raise BridgeError("tool_protocol_error", "自定义工具输入必须是字符串", 502)
-    return "custom_tool_call", {"name": name, "input": val}
+    return "custom_tool_call", {"name": name, "input": val, **extra}
