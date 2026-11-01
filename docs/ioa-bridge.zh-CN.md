@@ -318,3 +318,29 @@ Codex App / CLI 还有独立的本地模型上下文设定：
 参考：[官方 SDK Python API](https://www.codebuddy.ai/docs/cli/sdk-python)、
 [CodeBuddy ACP 档位](https://www.codebuddy.cn/docs/cli/acp)、
 [CodeBuddy 自动压缩设置](https://www.codebuddy.ai/docs/cli/settings)。
+
+## Codex App 新版 Responses 消息兼容（2026-11-01）
+
+`agent_message` 是 Codex MultiAgentV2 的实际子智能体委派信息，不是普通聊天字段：
+桥接器会将**明文**任务/回复按原顺序映射成 SDK 的用户消息，并保留 `author/recipient`。
+同时兼容 `agent_reasoning`、Shell/Patch/MCP 等工具历史、`context_compaction`
+的明文摘要和常见控制事件；未来的纯文本历史消息也可以保留原类型标签进行兼容转换。
+
+**不是所有内容都能无损迁移**：OpenAI/Codex 专有的 `encrypted_content`、
+只有远端 ID 的 `item_reference`、无明文摘要的加密压缩状态仍无法通过本地
+CodeBuddy SDK 解码。遇到这些情况会给出明确错误，且不会收费调用上游。
+模型私有 reasoning 不转发，数量通过 `metadata.ioa_compat_omitted_private_reasoning` 报告。
+其他托管工具声明只作「不可用」标记，不能冒充真实搜索或文件操作结果。
+
+详细项目类型、回归测试及兼容边界：
+[Responses 兼容矩阵](ioa-responses-compatibility.md)。
+
+**无需消耗 AI TOKEN 的兼容性检查：**
+
+```bash
+curl -sS http://127.0.0.1:8791/v1/compatibility \
+  -H "Authorization: Bearer $IOA_BRIDGE_KEY" | python3 -m json.tool
+```
+
+该只读接口会显示当前适配器版本、支持的输入项目类别、仍不支持的加密状态与实际本地容量限制。
+`verified_upstream_context_tokens: null` 表明 **尚未验证 iOA 上游真正的 1M 上下文档位**。

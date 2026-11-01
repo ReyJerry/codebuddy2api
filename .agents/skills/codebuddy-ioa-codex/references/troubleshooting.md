@@ -58,3 +58,16 @@ vision-capable. A non-vision model may ask the SDK to use ViewImage; SDK-native
 tools are deliberately disabled, so check a live authorized image-test prompt.
 Never auto-run chargeable requests without consent. After upgrading, restart
 the bridge on 8791, then retry a synthetic non-sensitive image in Codex App.
+
+
+## Codex App modern Responses input-item errors (2026-11-01)
+
+- `422 ... agent_message`: Update to the adapter version exposed at authenticated `GET http://127.0.0.1:8791/v1/compatibility`. Plain MultiAgentV2 task delegation MUST be transferred as a labelled user-message turn, retaining author/recipient; dropping it makes subagents lose their task.
+- `agent_reasoning` / `reasoning`: model-private content is not replayed; the response metadata counts intentional omissions. Never pass hidden reasoning as fabricated user instructions.
+- `unsupported_encrypted_history`: an OpenAI/Codex-sealed `agent_message` or compaction cannot be decrypted by the CodeBuddy SDK. Never strip the ciphertext to force HTTP 200. Ask the user to start a new task using an explicit plaintext summary, or select a provider that can handle the sealed content natively.
+- `unavailable_compaction_summary`: an old compressed context has no portable plaintext summary; request a plaintext handoff instead of pretending to restore context.
+- `unsupported_item_reference`: item depends on a remote Responses store that the stateless local bridge does not have. Send full input or start a summarized session.
+- `unsupported_visual_tool_output`: tool history contains an image form the SDK cannot faithfully receive; do not replace it with fabricated description.
+- New safe text-bearing input types are labelled as history and can be handled without a one-by-one parser release; unrecognizable executable or opaque items still fail with an explicit index/type.
+
+See [modern Responses item reference](response-items.md) and the project's [compatibility matrix](https://github.com/ReyJerry/codebuddy2api/blob/codex-skill-v1/docs/ioa-responses-compatibility.md).

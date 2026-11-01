@@ -212,6 +212,33 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
         return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "codebuddy-ioa"}
                                              for m in names]}
 
+    @app.get("/v1/compatibility")
+    def compatibility(request: Request):
+        """Read-only, authenticated capabilities. Never prints user prompts or keys."""
+        if not _authorized(request, settings.bridge_key):
+            return _error(BridgeError("invalid_api_key", "无效的本地桥接密钥", 401))
+        return {
+            "adapter_revision": "2026-11-01-responses-compat-v2",
+            "runtime": "official-codebuddy-sdk",
+            "tool_calling": "experimental-prompt-json" if settings.experimental_tools else "disabled",
+            "input": {
+                "plaintext_agent_message": True,
+                "private_agent_reasoning": "omitted-with-metadata-counter",
+                "historical_tool_calls": "replayed-as-data-not-executed",
+                "plaintext_compaction": True,
+                "unknown_text_items": "labelled-history-only",
+                "encrypted_history": "unsupported-fail-closed",
+                "remote_item_reference": "unsupported-fail-closed",
+                "native_image_data_url": True,
+            },
+            "hosted_tools": "not-executable",
+            "limits": {"request_body_bytes": settings.max_body_bytes,
+                       "prompt_chars": settings.max_prompt_chars,
+                       "tool_schema_chars": settings.max_tool_spec_chars},
+            "sdk_auto_compact_window_tokens": settings.auto_compact_window_tokens,
+            "verified_upstream_context_tokens": None,
+        }
+
     @app.post("/v1/responses")
     async def responses(request: Request):
         if not _authorized(request, settings.bridge_key):
@@ -249,12 +276,14 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                 raise BridgeError("unsupported_history", "不支持服务端 previous_response_id；请发送完整 input 历史", 422)
             if body.get("background"):
                 raise BridgeError("unsupported_background", "不支持后台执行", 422)
+            translation_stats: dict[str, int] = {}
             image_sources: list[dict[str, Any]] = []
             image_marker = "\x1fioa_img_" + uuid.uuid4().hex + "_"
             prompt = conversation_prompt(body, tools=requested_tools,
                                          max_chars=settings.max_prompt_chars,
                                          image_sources=image_sources,
-                                         image_marker=image_marker)
+                                         image_marker=image_marker,
+                                         translation_stats=translation_stats)
             if requested_tools:
                 prompt = tool_prompt(prompt, active_tools, choice, deferred=deferred_previews)
                 # Tool schema and instructions also consume context; never silently truncate.
@@ -274,6 +303,10 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
             return _error(err)
 
         response = new_response(model)
+        if translation_stats:
+            response.setdefault("metadata", {}).update({
+                "ioa_compat_" + name: str(value) for name, value in translation_stats.items()
+            })
         if requested_tools:
             unavailable = [t["name"] for t in requested_tools
                            if t["type"] == "unavailable_hosted"]

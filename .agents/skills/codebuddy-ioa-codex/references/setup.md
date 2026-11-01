@@ -73,3 +73,12 @@ The bridge now defaults to `IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000` and passes `C
 The helper never edits the prior local repo, your `~/.codex/config.toml`, Magpie's providers JSON, shell rc files, enterprise accounts or SaaS Credits. No Docker, login-cookie transfer, token scraping, anonymous proxies, privilege bypass, or public network listening. Never run `rm -rf` on an unfamiliar old clone.
 
 To stop bridge, press Ctrl+C in its terminal. To restore Codex's prior default, choose the original model in Magpie; if using Magpie CLI, `magpie codex default` is documented, but obtain approval first because it changes the agent's current choice. No secrets need to be pasted into chat to diagnose the bridge.
+
+## Modern Codex Responses input items
+
+The bridge's modern adapter handles plaintext MultiAgentV2 `agent_message`
+(task delegation), client tool-search history, labelled Shell/Patch/MCP history,
+plaintext compaction summaries and safe text-bearing new history types. See
+[Responses items](response-items.md). **Never disable validation or discard an
+unknown item** to make an HTTP 422 go away: encrypted state and opaque remote
+references cannot be faithfully replayed through this SDK bridge.

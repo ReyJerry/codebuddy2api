@@ -249,3 +249,25 @@ it changes the client's budgeting, not the upstream model's capabilities.
 References: [Official SDK](https://www.codebuddy.ai/docs/cli/sdk-python),
 [ACP context tiers](https://www.codebuddy.ai/docs/cli/acp),
 [CodeBuddy auto-compact settings](https://www.codebuddy.ai/docs/cli/settings).
+
+## Modern Codex Responses item compatibility (2026-11-01)
+
+The adapter now normalizes **plaintext** `agent_message` task delegation and
+replies (with `author`/`recipient`), as well as supported history events,
+client tool search, plain compaction summaries and text-bearing new item types.
+Private `reasoning` items are not replayed and their count is reported in
+`metadata.ioa_compat_omitted_private_reasoning`.
+
+It **cannot** decrypt Codex/OpenAI `encrypted_content`, reconstruct a remote
+`item_reference`, or invent a plaintext summary for a sealed compaction. These
+cases fail with explicit errors before upstream inference. Hosted web/file
+search is still unavailable through this bridge, even if its tool definition
+appears in a Codex request. Do not treat a successful request as proof of
+native SDK tools or live search. See [the full compatibility matrix](ioa-responses-compatibility.md).
+
+Read-only compatibility inspection (no paid model call):
+
+```bash
+curl -sS http://127.0.0.1:8791/v1/compatibility \
+  -H "Authorization: Bearer $IOA_BRIDGE_KEY" | python3 -m json.tool
+```

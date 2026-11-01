@@ -453,7 +453,7 @@ def test_distinct_tool_shape_duplicate_and_type_errors():
         ({"type": "function"}, "invalid_tools_shape"),
         ("tool", "invalid_tools_shape"),
         (["not-an-object"], "invalid_tool_entry"),
-        ([{"type": "file_search", "vector_store_ids": ["vs_abc"]}], "unsupported_tool_type"),
+        ([{"type": "mystery_hosted_tool", "vector_store_ids": ["vs_abc"]}], "unsupported_tool_type"),
         (_many_codex_tools(1) * 2, "duplicate_tool_name"),
     ]:
         r = c.post("/v1/responses", headers=headers(), json={
@@ -923,3 +923,259 @@ def test_sdk_custom_compaction_baseline_is_passed_to_official_cli(monkeypatch, t
     assert "context_window" not in captured and "contextWindow" not in captured
     with pytest.raises(ValueError):
         SDKBackend(cwd=tmp_path, api_key="secret", auto_compact_window_tokens=2_000_000)
+
+
+# 2026-11-01 compatibility matrix for Codex App MultiAgentV2 and Responses
+# history. The synthetic requests mirror public Codex / Magpie wire formats;
+# no internal API, real images or paid model are touched in these tests.
+
+def _compat_post(items, *, backend=None, tool_declarations=None, stream=False):
+    fake = backend or FakeBackend()
+    c, observed = client(fake, tools=bool(tool_declarations))
+    req = {"model": "demo-model", "input": items, "stream": stream}
+    if tool_declarations is not None:
+        req["tools"] = tool_declarations
+    return c.post("/v1/responses", headers=headers(), json=req), observed
+
+
+def test_multiagent_v2_plaintext_delegation_and_reply_are_not_lost():
+    task = "Message Type: NEW_TASK\nPayload: create a safe tiny test"
+    reply = "Message Type: AGENT_REPLY\nStatus: OK"
+    r, backend = _compat_post([
+        {"type": "message", "role": "user", "content": "AGENTS.md instructions"},
+        {"type": "agent_message", "author": "/root", "recipient": "/root/probe",
+         "content": [{"type": "input_text", "text": task}]},
+        {"type": "agent_message", "author": "/root/probe", "recipient": "/root",
+         "content": [{"type": "input_text", "text": reply}]},
+    ])
+    assert r.status_code == 200, r.text
+    text_prompt = backend.calls[0][0]
+    assert task in text_prompt and reply in text_prompt
+    assert text_prompt.index("AGENTS.md") < text_prompt.index(task) < text_prompt.index(reply)
+    assert '"author": "/root"' in text_prompt and '"recipient": "/root/probe"' in text_prompt
+
+
+def test_multiagent_v2_agent_message_works_with_tool_calls_and_streaming():
+    output = '{"kind":"tool_call","name":"exec_command","arguments":{"cmd":"pwd"}}'
+    tools = [{"type": "function", "name": "exec_command", "parameters": {"type":"object"}}]
+    r, backend = _compat_post([{"type": "agent_message", "author": "/root", "recipient": "/root/worker",
+                                "content": [{"type": "input_text", "text": "Run pwd in test dir"}]}],
+                              backend=FakeBackend(output), tool_declarations=tools, stream=True)
+    assert r.status_code == 200 and '"type":"function_call"' in r.text
+    assert "Run pwd in test dir" in backend.calls[0][0]
+
+
+@pytest.mark.parametrize("bad_part", [
+    {"type": "encrypted_content", "encrypted_content": "opaque-private-payload"},
+    {"type": "input_text", "text": "task is not complete", "encrypted_content": "private"},
+])
+def test_multiagent_encrypted_content_fails_before_paid_sdk(bad_part):
+    r, backend = _compat_post([
+        {"type": "agent_message", "author": "/root", "recipient": "/root/worker", "content": [bad_part]}
+    ])
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unsupported_encrypted_history"
+    assert not backend.calls
+    assert "opaque-private-payload" not in r.text and "private" not in r.text
+
+
+@pytest.mark.parametrize("bad", [
+    {"type": "agent_message", "author": "/root", "recipient": "/root/worker", "content": []},
+    {"type": "agent_message", "content": [ {"type": "input_text", "text": ""} ]},
+    {"type": "agent_message", "author": 7, "content": [{"type": "input_text", "text": "hello"}]},
+])
+def test_invalid_agent_message_fails_without_backend_call(bad):
+    r, backend = _compat_post([bad])
+    assert r.status_code == 422 and r.json()["error"]["code"] == "unsupported_agent_message"
+    assert not backend.calls
+
+
+def test_agent_reasoning_and_reasoning_not_replayed_as_plaintext():
+    r, backend = _compat_post([
+        {"type": "agent_reasoning", "encrypted_content": "sealed-reasoning-secret",
+         "summary": [{"type": "summary_text", "text": "reasoning metadata"}]},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "private steps"}]},
+        {"type": "message", "role": "user", "content": "say OK"},
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json()["metadata"]["ioa_compat_omitted_private_reasoning"] == "2"
+    prompt = backend.calls[0][0]
+    assert "private steps" not in prompt and "sealed-reasoning-secret" not in prompt
+    assert "say OK" in prompt
+
+
+@pytest.mark.parametrize("it,expected", [
+    ({"type":"compaction","summary":"Old tasks finished; now test B"}, "Old tasks finished"),
+    ({"type":"context_compaction","content":[{"type":"summary_text","text":"Persisted files: a.py"}]}, "Persisted files"),
+    ({"type":"context_compaction","summary":[{"type":"summary_text","text":"Old state summary"}]}, "Old state summary"),
+])
+def test_plaintext_compaction_is_preserved(it, expected):
+    r,b=_compat_post([it,{"type":"message","role":"user","content":"next task"}])
+    assert r.status_code==200, r.text
+    assert expected in b.calls[0][0]
+    assert b.calls[0][0].index(expected)<b.calls[0][0].index("next task")
+
+
+@pytest.mark.parametrize("it,code", [
+    ({"type":"context_compaction","encrypted_content":"private-summary"}, "unsupported_encrypted_history"),
+    ({"type":"compaction","summary":[]}, "unavailable_compaction_summary"),
+    ({"type":"item_reference","id":"resp_remote"}, "unsupported_item_reference"),
+])
+def test_unportable_history_fails_closed(it,code):
+    r,b=_compat_post([it,{"type":"message","role":"user","content":"now"}])
+    assert r.status_code==422 and r.json()["error"]["code"]==code
+    assert not b.calls
+
+
+def test_compaction_trigger_not_a_user_instruction_and_is_accounted():
+    r,b=_compat_post([{"type":"compaction_trigger","reason":"over_budget"},
+                      {"type":"message","role":"user","content":"continue work"}])
+    assert r.status_code==200
+    assert r.json()["metadata"]["ioa_compat_compaction_triggers"]=="1"
+    assert "over_budget" not in b.calls[0][0]
+    assert "continue work" in b.calls[0][0]
+
+
+@pytest.mark.parametrize("type_name", [
+    "apply_patch_call", "apply_patch_call_output", "local_shell_call", "local_shell_call_output",
+    "shell_call", "shell_call_output", "mcp_call", "mcp_list_tools",
+    "mcp_approval_request", "mcp_approval_response", "computer_call", "computer_call_output",
+    "code_interpreter_call", "file_search_call", "web_search_call", "image_generation_call",
+    "program", "program_output", "configuration_update",
+    "new_vendor_call", "new_vendor_call_output",
+])
+def test_codex_historical_items_not_reexecuted_or_dropped(type_name):
+    r,b=_compat_post([{"type":type_name,"call_id":"call_history", "status":"completed",
+                       "output":"recorded result","action":{"command":"never-run-this"}},
+                      {"type":"message","role":"user","content":"read history"}])
+    assert r.status_code==200, (type_name,r.text)
+    prompt=b.calls[0][0]
+    assert "[historical_"+type_name in prompt
+    assert "recorded result" in prompt
+    assert "never-run-this" in prompt
+    # No shell is run by the bridge; only one mocked model call.
+    assert len(b.calls)==1
+
+
+def test_historical_tool_output_preserves_image_without_base64_text():
+    r,b=_compat_post([{"type":"computer_call_output","call_id":"call_img",
+                       "output":{"type":"computer_screenshot","image_url":_TEST_PNG}},
+                      {"type":"message","role":"user","content":"describe screenshot"}])
+    assert r.status_code==200, r.text
+    blocks=b.calls[0][0]
+    assert isinstance(blocks,list)
+    assert any(x["type"]=="image" for x in blocks)
+    assert not any(_TEST_PNG_B64 in x.get("text","") for x in blocks)
+    assert "[historical_computer_call_output" in blocks[0]["text"]
+
+
+def test_historical_tool_output_replays_mixed_text_and_image_order():
+    r,b=_compat_post([{"type":"computer_call_output","call_id":"call_img",
+                       "output":[{"type":"text","text":"before"},
+                                 {"type":"input_image","image_url":_TEST_PNG},
+                                 {"type":"output_text","text":"after"}]},
+                      {"type":"message","role":"user","content":"compare"}])
+    assert r.status_code==200, r.text
+    blocks=b.calls[0][0]
+    i=next(i for i,x in enumerate(blocks) if x["type"]=="image")
+    assert "before" in blocks[i-1]["text"]
+    assert "after" in blocks[i+1]["text"]
+
+
+def test_agent_message_image_plus_user_text_in_correct_order():
+    r,b=_compat_post([{"type":"agent_message","author":"/root", "recipient":"/root/pic",
+                       "content":[{"type":"input_text","text":"Look at image"},
+                                  {"type":"input_image","image_url":_TEST_PNG}]},
+                      {"type":"message","role":"user","content":"Any issues?"}])
+    assert r.status_code==200, r.text
+    blocks=b.calls[0][0]
+    assert isinstance(blocks,list)
+    assert "Look at image" in blocks[0]["text"]
+    assert blocks[1]["type"]=="image"
+    assert "Any issues?" in blocks[-1]["text"]
+
+
+@pytest.mark.parametrize("hosted",["file_search","code_interpreter","computer","image_generation",
+                                   "local_shell","shell","mcp","python"])
+def test_advertised_hosted_tools_marked_unavailable_not_silently_executed(hosted):
+    ans='{"kind":"message","text":"Hosted tool not available"}'
+    r,b=_compat_post("do ordinary code review",backend=FakeBackend(ans),
+                      tool_declarations=[{"type":hosted}])
+    assert r.status_code==200,r.text
+    assert hosted in r.json()["metadata"]["ioa_unavailable_hosted_tools"]
+    assert hosted in b.calls[0][0]
+    assert "NOT available" in b.calls[0][0]
+
+
+def test_unknown_text_item_compatible_but_unknown_opaque_rejected():
+    good={"type":"next_generation_note","author":"some-agent",
+          "content":[{"type":"input_text","text":"New portable textual detail"}]}
+    r,b=_compat_post([good,{"type":"message","role":"user","content":"go"}])
+    assert r.status_code==200
+    assert "next_generation_note" in b.calls[0][0]
+    assert "New portable textual detail" in b.calls[0][0]
+    assert r.json()["metadata"]["ioa_compat_generic_text_items"]=="1"
+    bad={"type":"some_binary_executable","blob":"aaa"}
+    r,b=_compat_post([bad,{"type":"message","role":"user","content":"go"}])
+    assert r.status_code==422 and r.json()["error"]["code"]=="unsupported_input_item"
+    assert not b.calls
+
+
+def test_additional_tools_without_developer_role_is_still_historical_only():
+    r,b=_compat_post([{"type":"additional_tools","role":"user","tools":[{"type":"function","name":"get_info"}]},
+                      {"type":"message","role":"user","content":"please answer"}])
+    assert r.status_code==200,r.text
+    assert "additional_tool_declarations" in b.calls[0][0]
+    assert "get_info" in b.calls[0][0]
+    # Important: it doesn't automatically execute anything.
+    assert len(b.calls)==1
+
+
+def test_refusal_and_agent_role_are_preserved():
+    r,b=_compat_post([{"type":"refusal","refusal":"Prior assistant refused"},
+                      {"type":"message","role":"agent","content":[{"type":"text","text":"agent note"}]},
+                      {"type":"message","role":"user","content":"continue"}])
+    assert r.status_code==200
+    assert "Prior assistant refused" in b.calls[0][0]
+    assert "[agent]" in b.calls[0][0]
+    assert "agent note" in b.calls[0][0]
+
+
+def test_opaque_payload_in_recorded_history_rejected_before_model():
+    r,b=_compat_post([{"type":"apply_patch_call","call_id":"secret",
+                       "encrypted_content":"ciphertext", "input":"hello"},
+                      {"type":"message","role":"user","content":"go"}])
+    assert r.status_code==422
+    assert r.json()["error"]["code"]=="unsupported_encrypted_history"
+    assert "ciphertext" not in r.text
+    assert not b.calls
+
+
+def test_tool_output_bad_image_cannot_be_silently_described():
+    r,b=_compat_post([{"type":"computer_call_output","call_id":"call_img",
+                       "output":{"type":"output_image","file_id":"unavailable"}},
+                      {"type":"message","role":"user","content":"describe"}])
+    assert r.status_code==422
+    assert r.json()["error"]["code"]=="unsupported_visual_tool_output"
+    assert not b.calls
+
+
+def test_compatibility_capabilities_endpoint_is_authenticated_and_truthful():
+    c,b=client()
+    assert c.get("/v1/compatibility").status_code==401
+    r=c.get("/v1/compatibility", headers=headers())
+    assert r.status_code==200
+    data=r.json()
+    assert data["input"]["plaintext_agent_message"] is True
+    assert data["input"]["encrypted_history"]=="unsupported-fail-closed"
+    assert data["tool_calling"]=="disabled"
+    assert data["verified_upstream_context_tokens"] is None
+    assert data["limits"]["request_body_bytes"] > 2_000_000
+    assert not b.calls
+
+
+def test_image_generation_history_cannot_be_misrepresented_as_visual_input():
+    r,b=_compat_post([{"type":"image_generation_call", "result":["encoded-output-image"]},
+                      {"type":"message","role":"user","content":"explain generated image"}])
+    assert r.status_code==422
+    assert r.json()["error"]["code"]=="unsupported_visual_tool_output"
+    assert not b.calls

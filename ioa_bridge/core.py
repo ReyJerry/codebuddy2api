@@ -173,7 +173,11 @@ def image_prompt_blocks(prompt: str, sources: list[dict[str, Any]],
 # These are optional OpenAI-hosted capabilities, not executable Codex tools.
 # Accept their declarations only as *unavailable* so ordinary coding requests can
 # proceed, while explicitly warning the model and client. No simulated web results.
-_UNAVAILABLE_HOSTED = frozenset({"web_search", "web_search_preview"})
+_UNAVAILABLE_HOSTED = frozenset({
+    "web_search", "web_search_preview", "file_search", "code_interpreter",
+    "computer", "computer_use_preview", "image_generation", "local_shell",
+    "shell", "mcp", "python", "apply_patch", "code_execution",
+})
 
 
 def validate_tools(value: Any, *, max_chars: int = MAX_TOOL_SPEC_CHARS) -> list[dict[str, Any]]:
@@ -333,11 +337,129 @@ def active_tools_for_turn(tools: list[dict[str, Any]],
     return active, deferred
 
 
+
+# Codex App's Responses transport may replay its own MultiAgentV2 and tool
+# history items, not just the public API's `message` input.  This adapter
+# never executes these history items: they are presented to CodeBuddy as
+# labelled transcript evidence.  New plaintext message shapes can be read
+# generically, but opaque/encrypted state must fail closed.
+_KNOWN_HISTORY_ITEMS = frozenset({
+    "apply_patch_call", "apply_patch_call_output",
+    "local_shell_call", "local_shell_call_output", "shell_call", "shell_call_output",
+    "mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response",
+    "computer_call", "computer_call_output", "code_interpreter_call",
+    "file_search_call", "web_search_call", "image_generation_call",
+    "program", "program_output", "configuration_update",
+})
+_PRIVATE_REPLAY_ITEMS = frozenset({"reasoning", "agent_reasoning"})
+
+
+def _no_opaque_payload(value: Any, where: str) -> None:
+    """Reject undecipherable payloads instead of confusing ciphertext for text.
+
+    Keep this iterative to avoid deep recursion on user-origin JSON objects.
+    Only check known encryption fields, not unrelated strings or arbitrary
+    metadata keys. The check never logs values.
+    """
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, child in current.items():
+                if key in ("encrypted_content", "encrypted_function_args") and child not in (None, "", []):
+                    raise BridgeError("unsupported_encrypted_history",
+                                      f"{where} 包含不可解密的 Codex 状态；此本地 SDK 桥接无法迁移加密内容。"
+                                      "请使用有明文摘要的新会话，或改用能原生处理该类型的服务商", 422)
+                if isinstance(child, (dict, list)):
+                    pending.append(child)
+        elif isinstance(current, list):
+            pending.extend(v for v in current if isinstance(v, (dict, list)))
+
+
+def _history_content(value: Any, *, where: str,
+                     image_sources: list[dict[str, Any]] | None,
+                     image_marker: str | None) -> str:
+    """Render text or already-executed tool output without inventing its result."""
+    if isinstance(value, str) or isinstance(value, list):
+        return _text_content(value, image_sources=image_sources, image_marker=image_marker)
+    if isinstance(value, dict):
+        if value.get("type") == "computer_screenshot":
+            if image_sources is None or not image_marker:
+                raise BridgeError("unsupported_input", f"{where} 的截图需要多模态转换", 422)
+            source = _image_source({"image_url": value.get("image_url")}, image_sources)
+            label = f"{image_marker}{len(image_sources)}{_IMAGE_END}"
+            image_sources.append(source)
+            return "[computer_screenshot]" + label
+        # A JSON object is a recorded tool result, not a simulated call.
+        _no_opaque_payload(value, where)
+        return json.dumps(value, ensure_ascii=False)
+    raise BridgeError("unsupported_input", f"{where} 必须是文本、内容块或 JSON 对象", 422)
+
+
+def _history_event(item: dict[str, Any], typ: str, *, where: str,
+                   image_sources: list[dict[str, Any]] | None,
+                   image_marker: str | None) -> str:
+    _no_opaque_payload(item, where)
+    # Keep image markers OUTSIDE json.dumps: it escapes control chars in our
+    # nonce delimiter, which would otherwise silently lose visual data.
+    kept: dict[str, Any] = {}
+    media_output: str | None = None
+    for k, v in item.items():
+        if k in ("type", "internal_chat_message_metadata_passthrough", "encrypted_content"):
+            continue
+        if k == "output" and ((isinstance(v, list) and v and all(
+                isinstance(x, dict) and x.get("type") in ("text", "input_text", "output_text", "input_image")
+                for x in v)) or (isinstance(v, dict) and v.get("type") == "computer_screenshot")):
+            media_output = _history_content(v, where=where + ".output",
+                                            image_sources=image_sources, image_marker=image_marker)
+        else:
+            kept[k] = v
+    # Provider-hosted generation may return image bytes encoded under `result`;
+    # this is not a screenshot data-URL we know how to project. Never imply
+    # that a language model received pixels when only an opaque blob exists.
+    if typ == "image_generation_call" and kept.get("result"):
+        raise BridgeError("unsupported_visual_tool_output",
+                          f"{where}.result 包含无法可靠转交的生成图片输出", 422)
+    # If a tool output holds an unsupported embedded image, don't feed its raw
+    # encoding to the model and then pretend the model saw pixels.
+    if isinstance(kept.get("output"), dict) and kept["output"].get("type") in (
+            "input_image", "output_image", "computer_screenshot"):
+        raise BridgeError("unsupported_visual_tool_output",
+                          f"{where}.output 包含当前桥接无法转换的视觉工具结果", 422)
+    text = f"[historical_{typ}: already recorded; do not execute]\n" + json.dumps(kept, ensure_ascii=False)
+    if media_output is not None:
+        text += "\n[historical_tool_output]\n" + media_output
+    return text
+
+
+def _compaction_text(item: dict[str, Any], *, where: str,
+                     image_sources: list[dict[str, Any]] | None,
+                     image_marker: str | None) -> str:
+    _no_opaque_payload(item, where)
+    summary = item.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        return "[compacted_context_summary]\n" + summary
+    if isinstance(summary, list) and summary:
+        if all(isinstance(x, dict) and isinstance(x.get("text"), str) for x in summary):
+            return "[compacted_context_summary]\n" + "\n".join(x["text"] for x in summary)
+    content = item.get("content")
+    if isinstance(content, list) and content and all(isinstance(c, dict) and
+            c.get("type") in ("summary_text", "input_text", "output_text", "text") and
+            isinstance(c.get("text"), str) for c in content):
+        return "[compacted_context_summary]\n" + "\n".join(c["text"] for c in content)
+    if isinstance(content, (str, list)) and content:
+        return "[compacted_context_summary]\n" + _history_content(
+            content, where=where + ".content", image_sources=image_sources, image_marker=image_marker)
+    raise BridgeError("unavailable_compaction_summary",
+                      f"{where} 没有可读取的上下文摘要；不能在不同模型之间无损迁移加密压缩状态。"
+                      "请在原客户端生成明文摘要并开启新会话", 422)
+
 def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
                         max_chars: int = MAX_INPUT_CHARS,
                         image_sources: list[dict[str, Any]] | None = None,
-                        image_marker: str | None = None) -> str:
-    """Flatten OpenAI Responses history without executing any tools in the bridge."""
+                        image_marker: str | None = None,
+                        translation_stats: dict[str, int] | None = None) -> str:
+    """Flatten Codex Responses history into loss-aware SDK prompt text."""
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
         raise BridgeError("unsupported_input", "instructions 必须为字符串", 422)
@@ -346,62 +468,131 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
         parts: list[str] = ["[user]\n" + request_input]
     elif isinstance(request_input, list):
         parts = []
-        for item in request_input:
+        for index, item in enumerate(request_input):
+            where = f"input[{index}]"
             if not isinstance(item, dict):
-                raise BridgeError("unsupported_input", "输入历史必须包含消息对象", 422)
+                raise BridgeError("unsupported_input", f"{where} 必须是消息对象", 422)
             typ = item.get("type")
             if typ in ("function_call_output", "custom_tool_call_output"):
                 call_id = item.get("call_id")
                 if not isinstance(call_id, str) or not call_id:
-                    raise BridgeError("unsupported_input", "工具结果缺少 call_id", 422)
-                output = item.get("output")
-                if not isinstance(output, str):
-                    output = _text_content(output, image_sources=image_sources,
-                                           image_marker=image_marker)
+                    raise BridgeError("unsupported_input", f"{where} 的工具结果缺少 call_id", 422)
+                _no_opaque_payload(item, where)
+                output = _history_content(item.get("output"), where=where + ".output",
+                                          image_sources=image_sources, image_marker=image_marker)
                 parts.append(f"[tool_result call_id={json.dumps(call_id)}]\n{output}")
             elif typ in ("function_call", "custom_tool_call"):
                 call_id, name = item.get("call_id"), item.get("name")
                 if not isinstance(call_id, str) or not isinstance(name, str):
-                    raise BridgeError("unsupported_input", "工具调用历史字段不完整", 422)
+                    raise BridgeError("unsupported_input", f"{where} 的工具调用历史字段不完整", 422)
+                _no_opaque_payload(item, where)
                 val = item.get("arguments") if typ == "function_call" else item.get("input")
                 parts.append(f"[previous_tool_call {json.dumps({'call_id':call_id,'name':name,'namespace':item.get('namespace'),'input':val},ensure_ascii=False)}]")
             elif typ == "tool_search_call":
                 call_id = item.get("call_id")
                 arguments = item.get("arguments")
                 if not isinstance(call_id, str) or not call_id:
-                    raise BridgeError("unsupported_input", "工具搜索调用缺少 call_id", 422)
+                    raise BridgeError("unsupported_input", f"{where} 工具搜索调用缺少 call_id", 422)
+                _no_opaque_payload(item, where)
                 if isinstance(arguments, str):
-                    # Some Codex versions replay arguments as a JSON string.
                     try:
                         arguments = json.loads(arguments)
                     except ValueError:
-                        raise BridgeError("unsupported_input", "工具搜索调用参数不是有效 JSON", 422) from None
+                        raise BridgeError("unsupported_input", f"{where} 工具搜索参数不是 JSON", 422) from None
                 if not isinstance(arguments, dict):
-                    raise BridgeError("unsupported_input", "工具搜索调用参数必须是对象", 422)
+                    raise BridgeError("unsupported_input", f"{where} 工具搜索参数必须是对象", 422)
                 parts.append(f"[previous_tool_search call_id={json.dumps(call_id)}]\n"
                              + json.dumps(arguments, ensure_ascii=False))
             elif typ == "tool_search_output":
                 call_id, discovered = item.get("call_id"), item.get("tools")
                 if not isinstance(call_id, str) or not isinstance(discovered, list):
-                    raise BridgeError("unsupported_input", "工具搜索结果缺少 call_id 或 tools 数组", 422)
+                    raise BridgeError("unsupported_input", f"{where} 工具搜索结果缺少 call_id 或 tools", 422)
+                _no_opaque_payload(item, where)
                 parts.append(f"[tool_search_result call_id={json.dumps(call_id)}]\n"
                              + json.dumps(discovered, ensure_ascii=False))
             elif typ == "additional_tools":
-                if item.get("role") != "developer" or not isinstance(item.get("tools"), list):
-                    raise BridgeError("unsupported_input", "additional_tools 必须包含 developer 角色及工具数组", 422)
-                parts.append("[additional_tool_declarations]\n" + json.dumps(item["tools"], ensure_ascii=False))
-            elif typ in (None, "message"):
+                declared = item.get("tools")
+                if not isinstance(declared, list):
+                    raise BridgeError("unsupported_input", f"{where} additional_tools 缺少 tools 数组", 422)
+                _no_opaque_payload(item, where)
                 role = item.get("role")
-                if role not in ("system", "developer", "user", "assistant", "tool"):
-                    raise BridgeError("unsupported_input", "消息角色无效", 422)
-                parts.append(f"[{role}]\n{_text_content(item.get('content'),
-                         image_sources=image_sources if role == 'user' else None,
-                         image_marker=image_marker)}")
-            elif typ in ("reasoning", "refusal"):
-                # Never reinterpret hidden reasoning or provider-private blobs as input text.
+                if role is not None and (not isinstance(role, str) or len(role) > 64):
+                    raise BridgeError("unsupported_input", f"{where} additional_tools 角色无效", 422)
+                # Historic discovery is not permission to execute an undeclared tool.
+                parts.append("[additional_tool_declarations role=" + json.dumps(role) + "]\n"
+                             + json.dumps(declared, ensure_ascii=False))
+            elif typ == "agent_message":
+                # Codex MultiAgentV2 passes the worker's actual task through this
+                # item. It must be treated as a user message, not dropped.
+                _no_opaque_payload(item, where)
+                content = item.get("content")
+                if not isinstance(content, (str, list)) or not content:
+                    raise BridgeError("unsupported_agent_message", f"{where} 缺少可读取的子智能体任务内容", 422)
+                message = _text_content(content, image_sources=image_sources, image_marker=image_marker)
+                if not message.strip():
+                    raise BridgeError("unsupported_agent_message", f"{where} 子智能体消息为空", 422)
+                author, recipient = item.get("author"), item.get("recipient")
+                for label, value in (("author", author), ("recipient", recipient)):
+                    if value is not None and (not isinstance(value, str) or len(value) > 1024):
+                        raise BridgeError("unsupported_agent_message", f"{where} 的 {label} 无效", 422)
+                parts.append("[user agent_message " + json.dumps(
+                    {"author": author, "recipient": recipient}, ensure_ascii=False) + "]\n" + message)
+            elif typ in (None, "message"):
+                _no_opaque_payload(item, where)
+                role = item.get("role")
+                if role not in ("system", "developer", "user", "assistant", "tool", "agent", "critic", "discriminator"):
+                    raise BridgeError("unsupported_input", f"{where} 的消息角色无效", 422)
+                value = _text_content(item.get("content"), image_sources=image_sources,
+                                      image_marker=image_marker)
+                # Arbitrary non-system roles are transcript data, not system instructions.
+                parts.append(f"[{role}]\n{value}")
+            elif typ in _PRIVATE_REPLAY_ITEMS:
+                # Never pass model-private chain-of-thought, encrypted state or
+                # synthetic text for it to another provider. The omission is
+                # explicitly counted for the response metadata.
+                if translation_stats is not None:
+                    translation_stats["omitted_private_reasoning"] = translation_stats.get("omitted_private_reasoning", 0) + 1
                 continue
+            elif typ == "refusal":
+                _no_opaque_payload(item, where)
+                refusal = item.get("refusal")
+                if isinstance(refusal, str):
+                    parts.append("[assistant_refusal]\n" + refusal)
+                elif "content" in item:
+                    parts.append("[assistant_refusal]\n" + _text_content(
+                        item["content"], image_sources=image_sources, image_marker=image_marker))
+                else:
+                    raise BridgeError("unsupported_input", f"{where} 的拒绝消息无内容", 422)
+            elif typ in ("compaction", "context_compaction"):
+                parts.append(_compaction_text(item, where=where,
+                                              image_sources=image_sources, image_marker=image_marker))
+            elif typ == "compaction_trigger":
+                # A trigger has no summary: it isn't a replacement for the
+                # preceding messages and should not be treated as a user turn.
+                if translation_stats is not None:
+                    translation_stats["compaction_triggers"] = translation_stats.get("compaction_triggers", 0) + 1
+                continue
+            elif typ == "item_reference":
+                raise BridgeError("unsupported_item_reference",
+                                  f"{where} 使用服务端 item_reference；本地桥接没有远端 Responses 项目存储。"
+                                  "请让客户端发送完整历史，或开启包含明文摘要的新会话", 422)
+            elif typ in _KNOWN_HISTORY_ITEMS or isinstance(typ, str) and (
+                    typ.endswith("_call") or typ.endswith("_call_output")):
+                parts.append(_history_event(item, typ, where=where,
+                                            image_sources=image_sources, image_marker=image_marker))
+            elif isinstance(typ, str) and isinstance(item.get("content"), (str, list)) and item["content"]:
+                # Forward-compatible *text-bearing* history with an explicit
+                # label; no guessing about opaque or executable payloads.
+                _no_opaque_payload(item, where)
+                plain = _text_content(item["content"], image_sources=image_sources,
+                                      image_marker=image_marker)
+                parts.append(f"[historical_text_item type={json.dumps(typ)}]\n" + plain)
+                if translation_stats is not None:
+                    translation_stats["generic_text_items"] = translation_stats.get("generic_text_items", 0) + 1
             else:
-                raise BridgeError("unsupported_input", f"暂不支持输入项目类型：{str(typ)[:48]}", 422)
+                raise BridgeError("unsupported_input_item",
+                                  f"{where} 的 type={str(typ)[:64]!r} 无法安全转换；"
+                                  "请提供脱敏的消息类型及字段名以补充适配", 422)
     else:
         raise BridgeError("unsupported_input", "input 必须为字符串或消息列表", 422)
     if instructions:
