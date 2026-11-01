@@ -217,3 +217,35 @@ bridge deliberately disables SDK-native tools, so such hints do not guarantee
 image analysis. The SDK stream-json message shape is documented, but the
 bridge's end-to-end image route still requires an authorized live smoke test.
 Restart port 8791 after upgrading.
+
+
+## 1M context preference versus an actual model context tier
+
+The bridge defaults to `IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000`, passed to the
+official CLI as `CODEBUDDY_AUTO_COMPACT_WINDOW`. This configures the
+**auto-compaction baseline only**. It is **not** a model-context-window override
+and does not prove that a particular iOA model or account has a 1M-token tier.
+The CodeBuddy runtime clamps auto-compaction to the selected model's actual
+effective context budget. The bridge never silently truncates the Codex history.
+
+To change the baseline (range 100000–1000000), restart the local bridge:
+
+```bash
+export IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+The upstream 200K/1M **context tier** is currently exposed through
+CodeBuddy's ACP `context_window` session config option, which validates the
+model's `contextWindow.supportedLengths`. The public Python SDK
+`CodeBuddyAgentOptions` does not expose a corresponding `context_window`
+parameter. This SDK-backed bridge therefore cannot currently select or verify
+the actual 1M tier. Do not equate `--autocompact 1m` with model-tier selection.
+
+Codex offers its own `model_context_window = 1000000` config. Only set that
+when the selected provider/model's true 1M context support has been verified;
+it changes the client's budgeting, not the upstream model's capabilities.
+
+References: [Official SDK](https://www.codebuddy.ai/docs/cli/sdk-python),
+[ACP context tiers](https://www.codebuddy.ai/docs/cli/acp),
+[CodeBuddy auto-compact settings](https://www.codebuddy.ai/docs/cli/settings).

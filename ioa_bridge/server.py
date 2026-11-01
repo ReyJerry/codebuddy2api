@@ -26,6 +26,11 @@ MAX_CONFIG_BODY_MB = 256
 MAX_CONFIG_PROMPT_CHARS = 32_000_000
 MAX_CONFIG_TOOL_SPEC_CHARS = 32_000_000
 
+# CodeBuddy CLI auto-compaction budget baseline; NOT an upstream context-tier selector.
+DEFAULT_AUTOCOMPACT_TOKENS = 1_000_000
+MIN_AUTOCOMPACT_TOKENS = 100_000
+MAX_AUTOCOMPACT_TOKENS = 1_000_000
+
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     raw = os.getenv(name)
@@ -63,6 +68,7 @@ class Settings:
     max_body_bytes: int = DEFAULT_MAX_BODY_MB * 1024 * 1024
     max_prompt_chars: int = MAX_INPUT_CHARS
     max_tool_spec_chars: int = MAX_TOOL_SPEC_CHARS
+    auto_compact_window_tokens: int = DEFAULT_AUTOCOMPACT_TOKENS
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -82,8 +88,11 @@ class Settings:
         chars = _env_int("IOA_BRIDGE_MAX_PROMPT_CHARS", MAX_INPUT_CHARS, 100_000, MAX_CONFIG_PROMPT_CHARS)
         tool_chars = _env_int("IOA_BRIDGE_MAX_TOOL_SPEC_CHARS", MAX_TOOL_SPEC_CHARS,
                               1_000, MAX_CONFIG_TOOL_SPEC_CHARS)
+        compact_tokens = _env_int("IOA_BRIDGE_AUTOCOMPACT_TOKENS",
+                                  DEFAULT_AUTOCOMPACT_TOKENS,
+                                  MIN_AUTOCOMPACT_TOKENS, MAX_AUTOCOMPACT_TOKENS)
         return cls(key, api_key, cwd, os.getenv("IOA_BRIDGE_EXPERIMENTAL_TOOLS") == "1",
-                   mb * 1024 * 1024, chars, tool_chars)
+                   mb * 1024 * 1024, chars, tool_chars, compact_tokens)
 
 
 def _error(err: BridgeError) -> JSONResponse:
@@ -185,7 +194,8 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                catalog: ModelCatalog | None = None) -> FastAPI:
     """Construct a bridge without reading credentials or starting SDK processes."""
     settings = settings or Settings.from_env()
-    backend = backend or SDKBackend(cwd=settings.cwd, api_key=settings.api_key)
+    backend = backend or SDKBackend(cwd=settings.cwd, api_key=settings.api_key,
+                                    auto_compact_window_tokens=settings.auto_compact_window_tokens)
     catalog = catalog or ModelCatalog()
     sessions = SessionManager()
     app = FastAPI(title="Local CodeBuddy iOA SDK Responses bridge", version="0.1.0")

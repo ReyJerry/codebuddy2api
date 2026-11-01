@@ -266,6 +266,7 @@ def test_sdk_options_disable_tools_and_keep_stable_cwd(monkeypatch, tmp_path):
     assert captured["cwd"] == str(tmp_path)
     assert captured["setting_sources"] == []
     assert captured["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"] == "ioa"
+    assert captured["env"]["CODEBUDDY_AUTO_COMPACT_WINDOW"] == "1000000"
     assert captured["persist_session"] is False
 
 
@@ -867,3 +868,58 @@ def test_codex_text_only_keeps_previous_sdk_string_path():
     r = c.post("/v1/responses", headers=headers(), json={"model":"demo-model", "input":"hello"})
     assert r.status_code == 200
     assert backend.calls[0][0] == "[user]\nhello"
+
+
+def test_default_1m_compaction_baseline_is_not_an_upstream_context_claim(monkeypatch, tmp_path):
+    env = {"IOA_BRIDGE_KEY": "z" * 32, "CODEBUDDY_API_KEY": "secret",
+           "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa", "IOA_BRIDGE_CWD": str(tmp_path)}
+    with patch.dict(os.environ, env, clear=True):
+        settings = Settings.from_env()
+        assert settings.auto_compact_window_tokens == 1_000_000
+        # No model context-tier selection is represented by Settings.
+        assert not hasattr(settings, "context_window_tokens")
+    with patch.dict(os.environ, {**env, "IOA_BRIDGE_AUTOCOMPACT_TOKENS": "200000"}, clear=True):
+        assert Settings.from_env().auto_compact_window_tokens == 200_000
+    for bad in ("0", "100", "1000001", "1M", "not-a-number"):
+        with patch.dict(os.environ, {**env, "IOA_BRIDGE_AUTOCOMPACT_TOKENS": bad}, clear=True):
+            with pytest.raises(RuntimeError):
+                Settings.from_env()
+
+
+def test_sdk_custom_compaction_baseline_is_passed_to_official_cli(monkeypatch, tmp_path):
+    module = ModuleType("codebuddy_agent_sdk")
+    class AssistantMessage:
+        def __init__(self, content): self.content = content
+    class TextBlock:
+        def __init__(self, text): self.text = text
+    class StreamEvent: pass
+    class ResultMessage:
+        is_error = False
+        result = "OK"
+        usage = {"input_tokens": 8, "output_tokens": 1}
+    captured = {}
+    class CodeBuddyAgentOptions:
+        def __init__(self, **kwargs): captured.update(kwargs)
+    async def query(*, prompt, options):
+        yield AssistantMessage([TextBlock("OK")])
+        yield ResultMessage()
+    module.AssistantMessage = AssistantMessage
+    module.TextBlock = TextBlock
+    module.StreamEvent = StreamEvent
+    module.ResultMessage = ResultMessage
+    module.CodeBuddyAgentOptions = CodeBuddyAgentOptions
+    module.query = query
+    monkeypatch.setitem(sys.modules, "codebuddy_agent_sdk", module)
+    async def collect():
+        return [item async for item in SDKBackend(cwd=tmp_path, api_key="secret",
+                                                 auto_compact_window_tokens=200_000).generate(
+            "probe", "demo-model", stream=False)]
+    result = asyncio.run(collect())
+    assert result[-1][1]["text"] == "OK"
+    assert captured["env"]["CODEBUDDY_AUTO_COMPACT_WINDOW"] == "200000"
+    assert captured["tools"] == []
+    assert captured["setting_sources"] == []
+    assert captured["permission_mode"] == "default"
+    assert "context_window" not in captured and "contextWindow" not in captured
+    with pytest.raises(ValueError):
+        SDKBackend(cwd=tmp_path, api_key="secret", auto_compact_window_tokens=2_000_000)

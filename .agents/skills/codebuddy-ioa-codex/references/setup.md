@@ -64,6 +64,10 @@ Official Magpie guides: https://usemagpie.ai/docs/start and https://usemagpie.ai
 - The model's actual context size, SDK overhead and provider billing are independent. `usage.input_tokens_details.cached_tokens` and metadata cache counters reflect the backend's reported usage, not guaranteed RMB discounts. Do not auto-retry paid requests.
 - Session history and Prompt Cache are different: old OpenAI cache cannot be migrated to iOA. The bridge currently does not support `previous_response_id` server-side state. Do not mix full-history Codex requests with persistent SDK sessions.
 
+## Context window preference (1M default)
+
+The bridge now defaults to `IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000` and passes `CODEBUDDY_AUTO_COMPACT_WINDOW=1000000` to the official SDK CLI. This is an **auto-compaction baseline**, not a guarantee that the iOA model is running the real 1M-tier context. For ACP and Codex App configuration differences, refer to [context window guide](context-window.md). Do not edit `~/.codex/config.toml` without the owner's explicit approval.
+
 ## Safety and rollback
 
 The helper never edits the prior local repo, your `~/.codex/config.toml`, Magpie's providers JSON, shell rc files, enterprise accounts or SaaS Credits. No Docker, login-cookie transfer, token scraping, anonymous proxies, privilege bypass, or public network listening. Never run `rm -rf` on an unfamiliar old clone.

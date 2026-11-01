@@ -281,3 +281,40 @@ Bridge 现已支持 **Responses `input_image` 的 Base64 `data:image/...;base64,
   `tools=[]` 模式无法自行执行 ViewImage，不能误认为模型一定成功识图。
 - 已完成不扣费的离线单元测试，**真实 iOA 多模态请求仍需用户在获授权环境下
   自行确认**。升级代码后必须重启 8791 服务。
+
+
+## 1M 上下文设置：CodeBuddy 模型档位与自动压缩预算的区别
+
+本桥接**默认配置 `IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000`**，由
+`CodeBuddyAgentOptions.env["CODEBUDDY_AUTO_COMPACT_WINDOW"]` 传给官方 CLI。
+该值是**自动压缩阈值的基准**，不是实际模型上下文窗口的强制开关，也不代表
+`gpt-6-astra` 的 iOA API 已按 1M Token 接受请求。CodeBuddy CLI 会将此值
+与模型的有效上下文预算取较小值；本桥接仍将完整的 Codex 历史交给 SDK，
+不会因为该设置擅自截断。
+
+```bash
+# 可选：设置自动压缩预算（默认已经是 1M）
+export IOA_BRIDGE_AUTOCOMPACT_TOKENS=1000000
+uv run --locked --with codebuddy-agent-sdk python -m ioa_bridge
+```
+
+支持设置 100000–1000000 的整数；需重启 8791 才生效。
+如使用较小窗口的模型，可设置 `200000`；未明确验证模型支持 1M 时，
+不应仅因本地配置就声称已获得 1M 上下文。
+
+**真正的 200K / 1M 模型档位**：CodeBuddy 官方目前通过 ACP 的
+`getConfigOptions` / `setSessionConfigOption('context_window', value)` 提供，
+并对模型声明的 `supportedLengths` 做校验。当前 Python SDK 的
+`CodeBuddyAgentOptions` 没有公开 `context_window` 参数，桥接使用的是
+Python SDK `query()` 而非 ACP，因此**尚不能直接切换或验证这个真实档位**。
+不要把 CLI 的 `--autocompact 1m` 等同于选中 1M 档。
+
+Codex App / CLI 还有独立的本地模型上下文设定：
+`~/.codex/config.toml` 中的 `model_context_window = 1000000`。
+**只有确认当前 iOA 模型支持 1M 时**才应设置它，因为它只改变 Codex 的
+窗口估计和压缩策略，不会把服务器模型从 200K 扩容到 1M。
+不要自动改写或覆盖用户现有 Magpie/Codex 配置。
+
+参考：[官方 SDK Python API](https://www.codebuddy.ai/docs/cli/sdk-python)、
+[CodeBuddy ACP 档位](https://www.codebuddy.cn/docs/cli/acp)、
+[CodeBuddy 自动压缩设置](https://www.codebuddy.ai/docs/cli/settings)。

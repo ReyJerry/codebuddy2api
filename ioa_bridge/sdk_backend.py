@@ -26,10 +26,14 @@ def _chunk_delta(message: Any) -> str:
 
 
 class SDKBackend:
-    def __init__(self, *, cwd: Path, api_key: str, timeout_seconds: int = 150):
+    def __init__(self, *, cwd: Path, api_key: str, timeout_seconds: int = 150,
+                 auto_compact_window_tokens: int = 1_000_000):
+        if not 100_000 <= auto_compact_window_tokens <= 1_000_000:
+            raise ValueError("auto_compact_window_tokens must be between 100K and 1M")
         self.cwd = cwd
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
+        self.auto_compact_window_tokens = auto_compact_window_tokens
 
     async def generate(self, prompt: str | list[dict[str, Any]], model: str, *, stream: bool,
                        session_id: str | None = None) -> AsyncIterator[tuple[str, Any]]:
@@ -56,7 +60,10 @@ class SDKBackend:
             session_id=session_id,
             env={"CODEBUDDY_API_KEY": self.api_key,
                  "CODEBUDDY_INTERNET_ENVIRONMENT": "ioa",
-                 "CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS": "1"},
+                 "CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS": "1",
+                 # Official CLI autoCompactWindow baseline. This does NOT choose
+                 # the 1M model context tier; model/provider may enforce 200K.
+                 "CODEBUDDY_AUTO_COMPACT_WINDOW": str(self.auto_compact_window_tokens)},
         )
         partial = ""
         final = ""
