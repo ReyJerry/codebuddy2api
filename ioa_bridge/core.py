@@ -614,22 +614,40 @@ def tool_prompt(prompt: str, tools: list[dict[str, Any]], choice: Any,
     """
     usable = [t for t in tools if t["type"] != "unavailable_hosted"]
     unavailable = [t["name"] for t in tools if t["type"] == "unavailable_hosted"]
+    discovery_enabled = any(t["type"] == "tool_search" and
+                            t.get("execution") == "client" for t in usable)
+    if deferred and not discovery_enabled:
+        # Never tell the model to discover tools without client authorization.
+        raise BridgeError("unsupported_tool_discovery",
+                          "客户端没有声明 tool_search，不能访问延迟加载的工具", 422)
     rule = (
         "You are the reasoning backend for an external coding agent. "
         "Only the external Codex client executes tools under its own approvals. "
-        "Return EXACTLY one JSON object, no Markdown. "
+        "Return EXACTLY one JSON object and no Markdown. "
         "To answer: {\"kind\":\"message\",\"text\":\"...\"}. "
-        "To call one function: {\"kind\":\"tool_call\",\"name\":\"tool_name\","
-        "\"arguments\":{...}}. "
-        "To call one custom tool: {\"kind\":\"tool_call\","
-        "\"name\":\"tool_name\",\"input\":\"...\"}. "
-        "For a namespaced tool also include \"namespace\":\"namespace_name\". "
-        "For client-executed tool discovery: {\"kind\":\"tool_search_call\","
-        "\"arguments\":{\"query\":\"search terms\",\"limit\":8}}. "
-        "Do not request tool_search_call unless a client tool_search is declared. "
-        "For tools with defer_loading=true, request tool_search_call first. "
-        "Never invent tool names or tool results. If a previous tool result exists, use it."
     )
+    if any(t["type"] == "function" for t in usable):
+        rule += ("To call one declared function: {\"kind\":\"tool_call\","
+                 "\"name\":\"tool_name\",\"arguments\":{...}}. ")
+    if any(t["type"] == "custom" for t in usable):
+        rule += ("To call one declared custom tool: {\"kind\":\"tool_call\","
+                 "\"name\":\"tool_name\",\"input\":\"...\"}. ")
+    if any(t.get("namespace") for t in usable):
+        rule += 'For namespaced tools include "namespace":"namespace_name". '
+    if discovery_enabled:
+        rule += (
+            'The Codex client advertised tool discovery. You may request '
+            '{"kind":"tool_search_call","arguments":{"query":"search terms","limit":8}}. '
+            'For deferred tools, discover them before requesting their invocation. '
+        )
+    else:
+        rule += (
+            "This request has NO client tool discovery capability. Only message and "
+            "declared callable-tool responses are valid; do not attempt tool discovery "
+            "even if an earlier conversation turn mentioned it. If a required tool is "
+            "not available, answer with a message explaining the limitation. "
+        )
+    rule += "Never invent tool names or tool results. If a previous tool result exists, use it."
     if unavailable:
         rule += (" IMPORTANT: The following OpenAI-hosted tools were advertised "
                  "by the client but are NOT available through this CodeBuddy bridge: "
@@ -677,7 +695,17 @@ def parse_tool_answer(answer: str, tools: list[dict[str, Any]], choice: Any) -> 
             raise BridgeError("tool_protocol_error", "模型消息缺少字符串 text", 502)
         return "message", text
     if payload.get("kind") == "tool_search_call":
-        if not any(t["type"] == "tool_search" and t["execution"] == "client" for t in tools):
+        if not any(t["type"] == "tool_search" and t.get("execution") == "client" for t in tools):
+            if choice in (None, "auto"):
+                # A model may disobey the prompt and request unadvertised
+                # discovery. Do not fabricate tool_search_call, invoke an
+                # unauthorized tool, or retry a paid model request. Return a
+                # truthful, visible diagnostic instead of breaking an SSE turn.
+                return ("unavailable_tool_search",
+                        "Codex did not advertise client tool discovery for this turn. "
+                        "The model attempted an unavailable tool search; no tool was "
+                        "executed for this turn. Continue with an advertised tool "
+                        "or enable client tool discovery in Codex.")
             raise BridgeError("tool_protocol_error", "未声明客户端 tool_search，禁止请求工具搜索", 502)
         if isinstance(choice, dict) and choice.get("type") != "tool_search":
             raise BridgeError("tool_protocol_error", "工具搜索不符合 tool_choice", 502)

@@ -83,3 +83,28 @@ This returns the adapter revision, recognized item families, bounded local
 limits, and `verified_upstream_context_tokens: null`. The latter is deliberate:
 an SDK auto-compact budget of 1M does not authenticate a real 1M backend tier.
 The probe is read-only and does not invoke the paid iOA model.
+
+
+## Tool-search guard (2026-11-01 v3)
+
+Codex sometimes supplies only `function`/`custom` tools, but Astra previously
+saw an **unconditional** example of `tool_search_call` in the generated system
+prompt and could emit an unauthorized discovery request. The bridge rejected
+that request after model inference, causing a `response.failed` SSE event and
+Magpie's misleading “stream disconnected before completion” error.
+
+The bridge now builds model instructions from **only the callable and discovery
+kinds actually advertised in the current `tools[]`**. In particular, absent
+client `tool_search` means no discovery JSON example or deferred-discovery
+instruction is placed in the prompt; historical discovery items confer no
+permission. No `tool_search` is synthesized or executed.
+
+If the model nevertheless requests an unadvertised search with `tool_choice=auto`,
+the bridge returns an explicit, truthful assistant notice and sets
+`metadata.ioa_tool_protocol_notice=unadvertised_tool_search`. No tool is executed,
+no missing tool is invented, and **the model request is not automatically
+retried**. With `tool_choice=required` or a specific tool choice, such an
+invalid model output continues to fail closed with `tool_protocol_error`.
+The notice completes the SSE turn, but it is **not proof that the requested
+coding task was completed**. The client/user may start a subsequent turn using
+an advertised tool. SDK-native MCP calling remains unimplemented.

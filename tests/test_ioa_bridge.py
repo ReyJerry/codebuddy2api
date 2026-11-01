@@ -1179,3 +1179,100 @@ def test_image_generation_history_cannot_be_misrepresented_as_visual_input():
     assert r.status_code==422
     assert r.json()["error"]["code"]=="unsupported_visual_tool_output"
     assert not b.calls
+
+
+# Regression: Astra may emit tool_search_call even though Codex did not
+# advertise tool_search. Do not prime an unavailable call in the prompt.
+def _ordinary_codex_tools():
+    return [
+        {"type": "function", "name": "exec_command", "description": "Run a shell command",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "custom", "name": "apply_patch", "format": {"type": "text"}},
+        {"type": "web_search", "external_web_access": False},
+    ]
+
+
+def test_tool_prompt_does_not_advertise_unavailable_search_or_namespace():
+    tools = validate_tools(_ordinary_codex_tools())
+    result = tool_prompt("[user]\nPlease patch the test", tools, "auto")
+    assert '"kind":"tool_search_call"' not in result
+    assert "tool_search_call" not in result
+    assert "defer_loading=true" not in result
+    assert '"namespace":"namespace_name"' not in result
+    assert "NO client tool discovery capability" in result
+    assert '"name": "exec_command"' in result
+    assert '"name": "apply_patch"' in result
+    assert "NOT available" in result and "web_search" in result
+
+
+def test_only_advertised_search_gets_search_instructions_and_is_still_executable():
+    tools = validate_tools(_codex_new_tools())
+    result = tool_prompt("[user]\nFind a calendar tool", tools, "auto")
+    assert '"kind":"tool_search_call"' in result
+    assert "discover them before" in result
+    c, backend = client(FakeBackend('{"kind":"tool_search_call","arguments":{"query":"calendar"}}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "find", "tools": _codex_new_tools()})
+    assert r.status_code == 200, r.text
+    assert r.json()["output"][0]["type"] == "tool_search_call"
+    assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_unadvertised_model_tool_search_call_yields_truthful_notice_not_sse_failure(stream):
+    backend = FakeBackend('{"kind":"tool_search_call","arguments":{"query":"find a patch tool"}}')
+    c, backend = client(backend, tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "repair a bug", "tools": _ordinary_codex_tools(),
+        "stream": stream})
+    assert r.status_code == 200, r.text
+    if stream:
+        assert "response.completed" in r.text
+        assert "response.failed" not in r.text
+        assert r.text.endswith("data: [DONE]\n\n")
+        result = [json.loads(x[6:]) for x in r.text.splitlines()
+                  if x.startswith("data: {") and '"type":"response.completed"' in x][-1]["response"]
+    else:
+        result = r.json()
+    assert result["status"] == "completed"
+    assert result["metadata"]["ioa_tool_protocol_notice"] == "unadvertised_tool_search"
+    item = result["output"][0]
+    assert item["type"] == "message"
+    assert "no tool was executed" in item["content"][0]["text"]
+    assert len(backend.calls) == 1  # zero automatic paid retries
+    assert "tool_search_call" not in backend.calls[0][0]
+
+
+@pytest.mark.parametrize("choice", ["required", {"type": "function", "name": "exec_command"}])
+def test_unadvertised_tool_search_still_fails_closed_for_required_tool(choice):
+    c, backend = client(FakeBackend('{"kind":"tool_search_call","arguments":{"query":"cmd"}}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "must run command", "tools": _ordinary_codex_tools(),
+        "tool_choice": choice})
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "tool_protocol_error"
+    assert len(backend.calls) == 1
+
+
+def test_unadvertised_search_does_not_bypass_tool_choice_or_unknown_tools():
+    c, backend = client(FakeBackend('{"kind":"tool_call","name":"ghost","arguments":{}}'), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": "call ghost", "tools": _ordinary_codex_tools()})
+    assert r.status_code == 502
+    assert r.json()["error"]["code"] == "tool_protocol_error"
+    assert len(backend.calls) == 1
+
+
+def test_deferred_schema_without_discovery_does_not_prime_tool_search():
+    tools = [{"type": "function", "name": "search_files", "defer_loading": True,
+              "parameters": {"type": "object", "properties": {}}}]
+    parsed = validate_tools(tools)
+    from ioa_bridge.core import active_tools_for_turn
+    active, previews = active_tools_for_turn(parsed, "find files")
+    assert not previews
+    prompt = tool_prompt("[user]\nFind files", active, "auto", deferred=previews)
+    assert "tool_search_call" not in prompt
+    assert "search_files" in prompt
+    with pytest.raises(BridgeError) as caught:
+        tool_prompt("a", active, "auto", deferred=[{"name": "hidden"}])
+    assert caught.value.status == 422 and caught.value.code == "unsupported_tool_discovery"

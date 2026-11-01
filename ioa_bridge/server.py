@@ -218,7 +218,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
         if not _authorized(request, settings.bridge_key):
             return _error(BridgeError("invalid_api_key", "无效的本地桥接密钥", 401))
         return {
-            "adapter_revision": "2026-11-01-responses-compat-v2",
+            "adapter_revision": "2026-11-01-responses-compat-v3",
             "runtime": "official-codebuddy-sdk",
             "tool_calling": "experimental-prompt-json" if settings.experimental_tools else "disabled",
             "input": {
@@ -231,6 +231,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                 "remote_item_reference": "unsupported-fail-closed",
                 "native_image_data_url": True,
             },
+            "tool_discovery": "advertised-client-only-no-automatic-retries",
             "hosted_tools": "not-executable",
             "limits": {"request_body_bytes": settings.max_body_bytes,
                        "prompt_chars": settings.max_prompt_chars,
@@ -344,7 +345,11 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                 sessions.record(session_key, raw_usage)
                 if requested_tools:
                     mode, data = parse_tool_answer(final_text, active_tools, choice)
-                    if mode == "message":
+                    if mode in ("message", "unavailable_tool_search"):
+                        if mode == "unavailable_tool_search":
+                            # Make protocol mismatches visible without claiming
+                            # that discovery ran, and without re-billing a retry.
+                            response.setdefault("metadata", {})["ioa_tool_protocol_notice"] = "unadvertised_tool_search"
                         item = _output_text(data)
                         for name, item_event in _text_events(item):
                             yield name, item_event

@@ -71,3 +71,11 @@ the bridge on 8791, then retry a synthetic non-sensitive image in Codex App.
 - New safe text-bearing input types are labelled as history and can be handled without a one-by-one parser release; unrecognizable executable or opaque items still fail with an explicit index/type.
 
 See [modern Responses item reference](response-items.md) and the project's [compatibility matrix](https://github.com/ReyJerry/codebuddy2api/blob/codex-skill-v1/docs/ioa-responses-compatibility.md).
+
+
+### v3: Model requests `tool_search_call` without a declared discovery tool
+
+- **Root cause:** Previous versions always included a `tool_search_call` JSON example in the model prompt even if Codex had provided only function/custom tools. Astra could then ask to discover tools it was never authorized to use.
+- **Fix:** Update to adapter revision `2026-11-01-responses-compat-v3`. The prompt now only describes actually advertised tools and discovery capabilities.
+- **Safe degradation:** In automatic tool-choice mode, if the model still asks for undeclared discovery, Bridge returns a visible diagnostic message with `metadata.ioa_tool_protocol_notice=unadvertised_tool_search`. **No discovery or command was executed; the coding task is not finished.** Required/specific tool-choice calls still fail closed.
+- The Bridge does **not** automatically retry paid inference or make up a replacement command. Verify the exact active revision through authenticated `GET /v1/compatibility`, then test Codex Shell/Patch in a disposable workspace.

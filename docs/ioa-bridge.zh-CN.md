@@ -344,3 +344,20 @@ curl -sS http://127.0.0.1:8791/v1/compatibility \
 
 该只读接口会显示当前适配器版本、支持的输入项目类别、仍不支持的加密状态与实际本地容量限制。
 `verified_upstream_context_tokens: null` 表明 **尚未验证 iOA 上游真正的 1M 上下文档位**。
+
+
+### 工具搜索提示词与 SSE 错误（2026-11-01 v3）
+
+如果出现 `未声明客户端 tool_search，禁止请求工具搜索` 或 Magpie 的
+`stream disconnected before completion`，这不是请求体或 1M 上下文限制。
+旧版会无条件向模型提供 `tool_search_call` 的 JSON 示例，即使 Codex
+本轮只声明了 `exec_command`、`apply_patch` 等工具，导致模型在推理后
+提出未经授权的工具搜索调用。
+
+新版只有在 Codex 显式声明 `tool_search` 且 `execution=client` 时才提供
+工具发现指令。未声明时只能选择本轮已声明的工具，或正常回答。
+若 Astra 仍生成未授权搜索，`tool_choice=auto` 下不再自动重试、不会伪造
+工具结果，而是返回清晰的说明并设置
+`metadata.ioa_tool_protocol_notice=unadvertised_tool_search`。
+**该说明表示本轮没有执行工具，不表示编码任务已完成。**
+强制工具调用时仍拒绝未授权的请求。更新代码后需重启 8791 服务。

@@ -271,3 +271,15 @@ Read-only compatibility inspection (no paid model call):
 curl -sS http://127.0.0.1:8791/v1/compatibility \
   -H "Authorization: Bearer $IOA_BRIDGE_KEY" | python3 -m json.tool
 ```
+
+
+### Unexpected tool search when Codex did not advertise it (2026-11-01 v3)
+
+Before v3, the experimental prompt always included the `tool_search_call` JSON
+example, even when Codex provided only `exec_command`/`apply_patch`. The model
+could then request an unadvertised tool and produce a 502 after model billing.
+New prompts only describe tool kinds declared by the current client request.
+For unsolicited discovery in auto mode, the bridge returns a **visible notice**
+(`metadata.ioa_tool_protocol_notice=unadvertised_tool_search`) rather than
+pretending a tool was executed or retrying a paid call. This notice is not a
+successful coding result. Required/specific tool choice still fails closed.
