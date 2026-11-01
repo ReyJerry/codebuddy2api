@@ -31,7 +31,7 @@ class SDKBackend:
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
 
-    async def generate(self, prompt: str, model: str, *, stream: bool,
+    async def generate(self, prompt: str | list[dict[str, Any]], model: str, *, stream: bool,
                        session_id: str | None = None) -> AsyncIterator[tuple[str, Any]]:
         """Yield ('delta', text), then ('result', metadata). SDK subprocess only."""
         try:
@@ -47,7 +47,6 @@ class SDKBackend:
             tools=[],              # Deliberately omit built-in tool *definitions*.
             allowed_tools=[],
             can_use_tool=_deny_all_tools,
-            # Codex owns file-edit approval. SDK must not inject plan-only instructions.
             permission_mode="default",
             max_turns=1,
             cwd=str(self.cwd),     # A stable, isolated directory; no project configs.
@@ -65,7 +64,15 @@ class SDKBackend:
         try:
             # A streaming SDK query is kept within the same task until closed.
             # Do not raise inside the async-for message-processing body.
-            async for message in query(prompt=prompt, options=options):
+            # Official CodeBuddy SDK accepts AsyncIterable[dict] for multimodal
+            # messages. Its stream-json shape is documented by Tencent.
+            if isinstance(prompt, list):
+                async def user_messages() -> AsyncIterator[dict[str, Any]]:
+                    yield {"type": "user", "message": {"role": "user", "content": prompt}}
+                sdk_prompt = user_messages()
+            else:
+                sdk_prompt = prompt
+            async for message in query(prompt=sdk_prompt, options=options):
                 if isinstance(message, StreamEvent):
                     if stream:
                         text = _chunk_delta(message)

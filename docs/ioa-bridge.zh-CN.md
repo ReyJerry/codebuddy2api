@@ -17,7 +17,7 @@
   下一次 Responses 请求把带 `call_id` 的工具结果送回模型。
   这是**提示词协议**，不是原生 Function Calling；在真实 Codex 上需要逐项验证，
   不保证所有模型、工具 Schema、并行调用及长时间任务都能稳定工作。
-- **未实现**：图像/音频输入、托管工具、`previous_response_id` 服务端检索、
+- **未实现**：音频/文件输入、远程图片 URL 自动获取、托管工具、`previous_response_id` 服务端检索、
   强一致 Session 恢复、WebSocket Responses、`tool_search`、完整的
   MCP 挂起/恢复回调。遇到不支持的能力应明确报错，而非偷偷丢弃。
 
@@ -252,3 +252,32 @@ Codex 现在可能在 Responses `tools` 中同时提交 `function`、`custom`、
 如仍发生类型问题，先记录不含密钥/参数的工具 `type`，再决定是否能安全兼容。
 上述修改不能保证所有新版本 Codex App/Magpie 的协议完全一致；在用于实际项目之前，
 应测试 `tool_search_call`、命名空间调用、工具返回和 Shell/Patch 全闭环。
+
+
+## Codex App 图片输入（`input_image`）
+
+Bridge 现已支持 **Responses `input_image` 的 Base64 `data:image/...;base64,...`**，
+通过官方 SDK `query(prompt=AsyncIterable[dict])` 发送为真正的 `image` 内容块，
+与原始文字保持相同顺序；**不会把图片当作文本描述，也不会静默丢弃**。
+支持 PNG、JPEG、WebP、GIF，单张最多 12 MiB，单次累计最多 32 MiB、
+最多 128 张（主要为了防止长期历史或异常输入耗尽本机内存）。
+这些限制属于本地保护，模型本身的图片/视觉能力和上下文窗口可能更小。
+
+示例（图片内容只在本机演示，真实截图请确认不含机密）：
+
+```json
+{"model":"gpt-6-astra","input":[{"role":"user","content":[
+  {"type":"input_text","text":"Describe this image"},
+  {"type":"input_image","image_url":"data:image/png;base64,<real-base64>"}
+]}],"stream":false}
+```
+
+- 仅支持安全的内嵌 Base64 data URL。`https://`、`file://` 或 `file_id`
+  会明确返回 `422 unsupported_image_reference`，**不会主动抓取外部 URL，避免 SSRF
+  或读取不该读取的本地文件**。
+- 损坏 Base64、不匹配的图片签名、超出体积上限会在调用收费 SDK 前报错。
+- 本桥接仍然把 Codex 的 Shell/Patch 工具交还 Codex 执行。是否真的看见像素，
+  取决于当前 iOA 模型的视觉支持；尤其当 SDK 把图片转成 ViewImage 路径提示，
+  `tools=[]` 模式无法自行执行 ViewImage，不能误认为模型一定成功识图。
+- 已完成不扣费的离线单元测试，**真实 iOA 多模态请求仍需用户在获授权环境下
+  自行确认**。升级代码后必须重启 8791 服务。

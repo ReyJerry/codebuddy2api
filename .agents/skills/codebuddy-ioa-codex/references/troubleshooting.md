@@ -35,3 +35,26 @@ python3 scripts/bridge_setup.py magpie
 If installed globally, use the full script path in `~/.agents/skills/codebuddy-ioa-codex/scripts/`. Run `probe --invoke` only with owner consent and the `--accept-charges` flag.
 
 Inspect only sanitized logs: no `Authorization` headers, `.env`, iOA keys, cookies, internal prompts, private corporate URLs or files. If a fix needs changing tool limits or model selection, record which layer's limit was hit. If a request failed **after** reaching the model backend, treat billing as possible even when the HTTP response is an error.
+
+
+## Codex App screenshot / input_image (2026-11)
+
+When a Responses request contains `input_image`, upgrade the SDK bridge to its
+native image-block adapter. The bridge accepts **Base64 data-image URLs** in user
+messages and tool results, and sends one ordered CodeBuddy SDK stream-json user
+message with `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}`.
+It never drops image pixels or substitutes fabricated text descriptions. Text
+requests retain the existing SDK string-prompt path.
+
+Supported: PNG, JPEG, WebP, GIF, max 12 MiB/image, 32 MiB combined, 128 images
+per request. A `422 unsupported_image_reference` means the client sent a URL or
+opaque file reference, not an embedded Base64 data URL. The bridge does **not**
+download network URLs or read arbitrary files. `422 invalid_image` means
+malformed Base64 or a mismatched image signature. For these errors, do not
+instruct the model to hallucinate the image or silently strip it.
+
+Even successful image transfer does not prove the current iOA model is
+vision-capable. A non-vision model may ask the SDK to use ViewImage; SDK-native
+tools are deliberately disabled, so check a live authorized image-test prompt.
+Never auto-run chargeable requests without consent. After upgrading, restart
+the bridge on 8791, then retry a synthetic non-sensitive image in Codex App.

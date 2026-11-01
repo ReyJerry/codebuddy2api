@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .catalog import ModelCatalog
 from .core import (BridgeError, MAX_INPUT_CHARS, MAX_TOOL_SPEC_CHARS, MODEL_ID, active_tools_for_turn,
-                   conversation_prompt, encode_sse, event, new_response, parse_tool_answer, response_usage,
+                   conversation_prompt, encode_sse, event, image_prompt_blocks, new_response, parse_tool_answer, response_usage,
                    tool_prompt, validate_tools)
 from .sdk_backend import SDKBackend
 from .sessions import SessionManager, is_single_delta
@@ -175,7 +175,7 @@ def _tool_events(item: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     ]
 
 
-async def _get_result(backend: Any, prompt: str, model: str, *, stream: bool,
+async def _get_result(backend: Any, prompt: str | list[dict[str, Any]], model: str, *, stream: bool,
                       session_id: str | None) -> AsyncIterator[tuple[str, Any]]:
     async for typ, data in backend.generate(prompt, model, stream=stream, session_id=session_id):
         yield typ, data
@@ -239,13 +239,20 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                 raise BridgeError("unsupported_history", "不支持服务端 previous_response_id；请发送完整 input 历史", 422)
             if body.get("background"):
                 raise BridgeError("unsupported_background", "不支持后台执行", 422)
+            image_sources: list[dict[str, Any]] = []
+            image_marker = "\x1fioa_img_" + uuid.uuid4().hex + "_"
             prompt = conversation_prompt(body, tools=requested_tools,
-                                         max_chars=settings.max_prompt_chars)
+                                         max_chars=settings.max_prompt_chars,
+                                         image_sources=image_sources,
+                                         image_marker=image_marker)
             if requested_tools:
                 prompt = tool_prompt(prompt, active_tools, choice, deferred=deferred_previews)
                 # Tool schema and instructions also consume context; never silently truncate.
                 if len(prompt) > settings.max_prompt_chars:
                     raise BridgeError("input_too_large", "工具说明和历史合并后超过本地字符限制", 413)
+            # Images stay as native SDK content blocks; do not turn them into
+            # fake text descriptions or silently drop them. No URL retrieval.
+            backend_prompt = image_prompt_blocks(prompt, image_sources, image_marker) if image_sources else prompt
             stream = body.get("stream", False)
             if not isinstance(stream, bool):
                 raise BridgeError("invalid_stream", "stream 必须为布尔值", 422)
@@ -281,7 +288,7 @@ def create_app(*, settings: Settings | None = None, backend: Any = None,
                                                                output_index=0, item_id=text_item["id"],
                                                                content_index=0,
                                                                part={"type": "output_text", "text": "", "annotations": []})
-                async for kind, payload in _get_result(backend, prompt, model, stream=stream, session_id=session_id):
+                async for kind, payload in _get_result(backend, backend_prompt, model, stream=stream, session_id=session_id):
                     if kind == "delta":
                         collected.append(payload)
                         if text_item is not None:

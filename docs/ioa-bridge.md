@@ -17,7 +17,7 @@ ledger and standard `converter.py` routes are not modified or read.
   `function_call` / `custom_tool_call`. The bridge never executes client tools.
 
 It **does not** implement native model function calling, full Codex tool fidelity,
-image/audio/file input, hosted tools, previous-response storage, WebSockets or
+audio/file input, remote image URL retrieval, hosted tools, previous-response storage, WebSockets or
 strongly consistent multi-process session recovery. Unsupported features fail
 explicitly instead of being silently discarded.
 
@@ -197,3 +197,23 @@ Codex may now send `function`, `custom`, `namespace`, client-executed
 The reported `tools[4]` denotes an array index, **not** a known tool kind.
 Re-verify tool discovery, namespace calls, and client Shell/Patch execution with
 real Codex App versions before use with important data.
+
+
+## Codex App image input (`input_image`)
+
+The bridge now converts OpenAI Responses `input_image` **Base64 data URLs** into
+CodeBuddy SDK stream-json `image` blocks. Text and image ordering are preserved.
+PNG, JPEG, WebP, and GIF are accepted; the local resource guard is 12 MiB per
+image, 32 MiB aggregate per request, and 128 images. Image bytes are neither
+inserted into the text prompt nor stored in project files.
+
+Remote URLs (`https://`, `file://`) and opaque `file_id` references fail explicitly
+with `422 unsupported_image_reference`; no server-side URL fetch/SSRF or arbitrary
+local file read. Invalid/corrupt declarations fail before a paid SDK call.
+
+**The upstream model still needs actual vision capability**. Some CodeBuddy
+versions turn user images for non-vision models into local ViewImage hints; this
+bridge deliberately disables SDK-native tools, so such hints do not guarantee
+image analysis. The SDK stream-json message shape is documented, but the
+bridge's end-to-end image route still requires an authorized live smoke test.
+Restart port 8791 after upgrading.

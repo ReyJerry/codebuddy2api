@@ -706,3 +706,164 @@ def test_exact_fifth_tool_web_search_does_not_break_coding_request():
     assert r.json()["output"][0]["type"] == "function_call"
     assert r.json()["metadata"]["ioa_unavailable_hosted_tools"] == "web_search"
     assert "NOT available" in b.calls[0][0]
+
+# Regression: Codex App sends OpenAI Responses input_image blocks, which must
+# actually reach the CodeBuddy SDK as native stream-json image blocks.
+_TEST_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+    "AAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg=="
+)
+_TEST_PNG = "data:image/png;base64," + _TEST_PNG_B64
+
+
+def _image_message(*parts):
+    return {"type": "message", "role": "user", "content": list(parts)}
+
+
+def test_codex_image_reaches_sdk_as_multimodal_blocks_without_leaking_into_text():
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": [
+            {"role": "system", "content": "Treat this as a photo analysis."},
+            _image_message({"type": "input_text", "text": "What is this?"},
+                           {"type": "input_image", "image_url": _TEST_PNG},
+                           {"type": "input_text", "text": "Please describe it."}),
+        ]})
+    assert r.status_code == 200, r.text[:200]
+    sdk_prompt = backend.calls[0][0]
+    assert isinstance(sdk_prompt, list)
+    assert [p["type"] for p in sdk_prompt] == ["text", "image", "text"]
+    assert "[system]" in sdk_prompt[0]["text"]
+    assert "What is this?" in sdk_prompt[0]["text"]
+    assert "Please describe it." in sdk_prompt[2]["text"]
+    assert sdk_prompt[1]["source"] == {"type": "base64", "media_type": "image/png", "data": _TEST_PNG_B64}
+    assert _TEST_PNG_B64 not in "".join(p.get("text", "") for p in sdk_prompt)
+    assert "data:image" not in str(r.json())
+
+
+def test_codex_multiple_images_preserve_order_and_context():
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": [
+            _image_message({"type": "input_image", "image_url": _TEST_PNG},
+                           {"type": "input_text", "text": "first photo"}),
+            {"role": "assistant", "content": "I see a tiny image."},
+            _image_message({"type": "input_text", "text": "Compare to this"},
+                           {"type": "input_image", "image_url": {"url": _TEST_PNG, "detail": "low"}}),
+        ]})
+    assert r.status_code == 200
+    prompt = backend.calls[0][0]
+    assert [p["type"] for p in prompt].count("image") == 2
+    assert prompt[0]["text"] == "[user]\n"
+    assert "first photo" in prompt[2]["text"]
+    assert "[assistant]" in prompt[2]["text"]
+    assert "Compare to this" in prompt[2]["text"]
+    assert prompt[3]["source"]["data"] == _TEST_PNG_B64
+
+
+def test_codex_image_with_experimental_tool_and_sse():
+    answer = '{"kind":"tool_call","name":"exec_command","arguments":{"cmd":"pwd"}}'
+    c, backend = client(FakeBackend(answer), tools=True)
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "stream": True,
+        "input": [_image_message({"type": "input_text", "text": "Inspect screenshot"},
+                                  {"type": "input_image", "image_url": _TEST_PNG})],
+        "tools": [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}],
+    })
+    assert r.status_code == 200
+    assert "response.function_call_arguments.delta" in r.text
+    prompt = backend.calls[0][0]
+    assert any(p["type"] == "image" for p in prompt)
+    assert "Available tools" in prompt[0]["text"] or '"name": "exec_command"' in prompt[0]["text"]
+
+
+def test_codex_image_tool_result_blocks_are_preserved():
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": [
+            {"type": "function_call_output", "call_id": "call_abc",
+             "output": [{"type": "input_text", "text": "Screenshot result:"},
+                        {"type": "input_image", "image_url": _TEST_PNG}]},
+            _image_message({"type": "input_text", "text": "Check tool screenshot"}),
+        ]})
+    assert r.status_code == 200
+    prompt = backend.calls[0][0]
+    assert any(p["type"] == "image" for p in prompt)
+    assert "[tool_result call_id=" in prompt[0]["text"]
+
+
+@pytest.mark.parametrize("url,code", [
+    ("https://example.org/image.png", "unsupported_image_reference"),
+    ("file:///tmp/sensitive.png", "unsupported_image_reference"),
+    ("data:image/png;base64,%%%%", "invalid_image"),
+    ("data:image/png;base64," + __import__("base64").b64encode(b"not an image").decode(), "invalid_image"),
+    ("data:application/pdf;base64," + _TEST_PNG_B64, "unsupported_image_type"),
+])
+def test_codex_unhandled_image_references_rejected_before_sdk(url, code):
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": [_image_message({"type": "input_image", "image_url": url})]})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == code
+    assert not backend.calls
+
+
+def test_codex_image_count_limit_without_upstream_call():
+    from ioa_bridge.core import MAX_IMAGE_COUNT
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={
+        "model": "demo-model", "input": [_image_message(*[
+            {"type": "input_image", "image_url": _TEST_PNG} for _ in range(MAX_IMAGE_COUNT + 1)
+        ])]})
+    assert r.status_code == 413
+    assert r.json()["error"]["code"] == "too_many_images"
+    assert not backend.calls
+
+
+def test_codex_sdk_real_image_stream_json_shape(monkeypatch, tmp_path):
+    module = ModuleType("codebuddy_agent_sdk")
+    class AssistantMessage:
+        def __init__(self, content): self.content = content
+    class TextBlock:
+        def __init__(self, text): self.text = text
+    class StreamEvent:
+        def __init__(self, event): self.event = event
+    class ResultMessage:
+        is_error = False
+        usage = {"input_tokens": 65, "output_tokens": 3}
+        num_turns = 1
+        duration_api_ms = 100
+        result = "IMAGE-OK"
+    captured = {}
+    class CodeBuddyAgentOptions:
+        def __init__(self, **kwargs): captured.update(kwargs)
+    async def query(*, prompt, options):
+        assert hasattr(prompt, "__aiter__")
+        messages = [p async for p in prompt]
+        captured["messages"] = messages
+        yield AssistantMessage([TextBlock("IMAGE-OK")])
+        yield ResultMessage()
+    module.AssistantMessage = AssistantMessage
+    module.TextBlock = TextBlock
+    module.StreamEvent = StreamEvent
+    module.ResultMessage = ResultMessage
+    module.CodeBuddyAgentOptions = CodeBuddyAgentOptions
+    module.query = query
+    monkeypatch.setitem(sys.modules, "codebuddy_agent_sdk", module)
+    blocks = [{"type": "text", "text": "Analyze:"},
+              {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": _TEST_PNG_B64}}]
+    async def collect():
+        return [e async for e in SDKBackend(cwd=tmp_path, api_key="secret").generate(
+            blocks, "demo-model", stream=False)]
+    result = asyncio.run(collect())
+    assert result[-1][1]["text"] == "IMAGE-OK"
+    assert captured["messages"] == [{"type": "user", "message": {"role": "user", "content": blocks}}]
+    assert captured["tools"] == [] and callable(captured["can_use_tool"])
+    assert captured["persist_session"] is False
+
+
+def test_codex_text_only_keeps_previous_sdk_string_path():
+    c, backend = client()
+    r = c.post("/v1/responses", headers=headers(), json={"model":"demo-model", "input":"hello"})
+    assert r.status_code == 200
+    assert backend.calls[0][0] == "[user]\nhello"

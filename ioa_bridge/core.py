@@ -1,6 +1,8 @@
 """Protocol translation and safety checks for the optional iOA SDK bridge."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import time
@@ -14,6 +16,12 @@ MAX_INPUT_CHARS = 16_000_000  # Local character ceiling, NOT a model token limit
 # Do not silently drop descriptions or parameters from the tool declarations.
 MAX_TOOL_SPEC_CHARS = 8_000_000
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+MAX_IMAGE_COUNT = 128  # Keep replays bounded while allowing large Codex histories.
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_TOTAL_BYTES = 32 * 1024 * 1024
+_IMAGE_MEDIA = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+_IMAGE_END = "\x1e"
+
 
 
 class BridgeError(Exception):
@@ -60,23 +68,106 @@ def encode_sse(name: str, obj: dict[str, Any]) -> bytes:
     return (f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False, separators=(',', ':'))}\n\n").encode("utf-8")
 
 
-def _text_content(content: Any) -> str:
+def _image_source(part: dict[str, Any], images: list[dict[str, Any]]) -> dict[str, Any]:
+    """Validate a Responses input_image without fetching URLs or reading local files.
+
+    CodeBuddy stream-json accepts base64 image blocks, not an OpenAI data URL.
+    The actual bytes are never inserted into a text prompt or written to disk.
+    """
+    if len(images) >= MAX_IMAGE_COUNT:
+        raise BridgeError("too_many_images", f"单次请求最多 {MAX_IMAGE_COUNT} 张图片；请缩短含图历史", 413)
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    if not isinstance(url, str):
+        raise BridgeError("unsupported_image_reference", "input_image 需要 base64 data:image URL；不支持 file_id", 422)
+    if not url.startswith("data:"):
+        raise BridgeError("unsupported_image_reference",
+                          "目前仅支持 data:image/...;base64 URL；暂不主动下载远程图片或读取本地文件", 422)
+    # Avoid copying/decoding megabytes merely to learn that an image is too big.
+    if len(url) > (MAX_IMAGE_BYTES * 4 // 3 + 4096):
+        raise BridgeError("image_too_large", "单张图片超过本地 12 MiB 大小限制", 413)
+    head, separator, data = url.partition(",")
+    if not separator or not head.endswith(";base64"):
+        raise BridgeError("invalid_image", "图片必须为标准 data:image/...;base64 格式", 422)
+    media_type = head[len("data:"):-len(";base64")].lower()
+    if media_type == "image/jpg":
+        media_type = "image/jpeg"
+    if media_type not in _IMAGE_MEDIA:
+        raise BridgeError("unsupported_image_type", "仅支持 PNG/JPEG/WebP/GIF 图片", 422)
+    if not data or len(data) % 4:
+        raise BridgeError("invalid_image", "图片 Base64 数据格式无效", 422)
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        raise BridgeError("invalid_image", "图片 Base64 数据格式无效", 422) from None
+    size = len(raw)
+    if not size:
+        raise BridgeError("invalid_image", "图片数据为空", 422)
+    if size > MAX_IMAGE_BYTES:
+        raise BridgeError("image_too_large", "单张图片超过本地 12 MiB 大小限制", 413)
+    total_size = size + sum(len(i["data"]) * 3 // 4 for i in images)
+    if total_size > MAX_IMAGE_TOTAL_BYTES:
+        raise BridgeError("images_too_large", "单次请求图片总量超过本地 32 MiB 限制", 413)
+    signatures = {
+        "image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
+        "image/webp": raw.startswith(b"RIFF") and raw[8:12] == b"WEBP",
+        "image/gif": raw.startswith((b"GIF87a", b"GIF89a")),
+    }
+    if not signatures[media_type]:
+        raise BridgeError("invalid_image", "图片数据与声明类型不符", 422)
+    return {"type": "base64", "media_type": media_type, "data": data}
+
+
+def _text_content(content: Any, *, image_sources: list[dict[str, Any]] | None = None,
+                  image_marker: str | None = None) -> str:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
-        raise BridgeError("unsupported_input", "只支持文本输入；未能识别消息内容", 422)
+        raise BridgeError("unsupported_input", "无法识别消息内容；必须为文本或内容块数组", 422)
     pieces = []
     for part in content:
         if not isinstance(part, dict):
-            raise BridgeError("unsupported_input", "消息内容必须为文本片段", 422)
+            raise BridgeError("unsupported_input", "消息内容块必须为对象", 422)
         t = part.get("type")
-        if t not in ("input_text", "output_text", "text"):
-            # No silent drops of images, audio, files or hosted tool results.
+        if t == "input_image" and image_sources is not None and image_marker:
+            source = _image_source(part, image_sources)
+            pieces.append(f"{image_marker}{len(image_sources)}{_IMAGE_END}")
+            image_sources.append(source)
+        elif t in ("input_text", "output_text", "text"):
+            if not isinstance(part.get("text"), str):
+                raise BridgeError("unsupported_input", "文本片段缺少 text 字段", 422)
+            pieces.append(part["text"])
+        else:
+            # Never silently drop images, audio, files or hosted tool results.
             raise BridgeError("unsupported_input", f"暂不支持内容类型：{str(t)[:48]}", 422)
-        if not isinstance(part.get("text"), str):
-            raise BridgeError("unsupported_input", "文本片段缺少 text 字段", 422)
-        pieces.append(part["text"])
     return "\n".join(pieces)
+
+
+def image_prompt_blocks(prompt: str, sources: list[dict[str, Any]],
+                        marker: str) -> list[dict[str, Any]]:
+    """Produce one ordered CodeBuddy SDK user-message content array.
+
+    Marker is a per-request 128-bit nonce, not a user-controlled fixed delimiter.
+    Text-only requests continue to use the regular SDK string query path.
+    """
+    if not sources:
+        return [{"type": "text", "text": prompt}]
+    out: list[dict[str, Any]] = []
+    cursor = 0
+    for index, source in enumerate(sources):
+        needle = f"{marker}{index}{_IMAGE_END}"
+        location = prompt.find(needle, cursor)
+        if location < 0:
+            raise BridgeError("image_projection_failed", "图片顺序转换失败，已拒绝发送请求", 500)
+        if location > cursor:
+            out.append({"type": "text", "text": prompt[cursor:location]})
+        out.append({"type": "image", "source": source})
+        cursor = location + len(needle)
+    if cursor < len(prompt):
+        out.append({"type": "text", "text": prompt[cursor:]})
+    return out
 
 
 # These are optional OpenAI-hosted capabilities, not executable Codex tools.
@@ -243,7 +334,9 @@ def active_tools_for_turn(tools: list[dict[str, Any]],
 
 
 def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
-                        max_chars: int = MAX_INPUT_CHARS) -> str:
+                        max_chars: int = MAX_INPUT_CHARS,
+                        image_sources: list[dict[str, Any]] | None = None,
+                        image_marker: str | None = None) -> str:
     """Flatten OpenAI Responses history without executing any tools in the bridge."""
     instructions = body.get("instructions")
     if instructions is not None and not isinstance(instructions, str):
@@ -263,7 +356,8 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
                     raise BridgeError("unsupported_input", "工具结果缺少 call_id", 422)
                 output = item.get("output")
                 if not isinstance(output, str):
-                    output = _text_content(output)
+                    output = _text_content(output, image_sources=image_sources,
+                                           image_marker=image_marker)
                 parts.append(f"[tool_result call_id={json.dumps(call_id)}]\n{output}")
             elif typ in ("function_call", "custom_tool_call"):
                 call_id, name = item.get("call_id"), item.get("name")
@@ -300,7 +394,9 @@ def conversation_prompt(body: dict[str, Any], *, tools: list[dict[str, Any]],
                 role = item.get("role")
                 if role not in ("system", "developer", "user", "assistant", "tool"):
                     raise BridgeError("unsupported_input", "消息角色无效", 422)
-                parts.append(f"[{role}]\n{_text_content(item.get('content'))}")
+                parts.append(f"[{role}]\n{_text_content(item.get('content'),
+                         image_sources=image_sources if role == 'user' else None,
+                         image_marker=image_marker)}")
             elif typ in ("reasoning", "refusal"):
                 # Never reinterpret hidden reasoning or provider-private blobs as input text.
                 continue
